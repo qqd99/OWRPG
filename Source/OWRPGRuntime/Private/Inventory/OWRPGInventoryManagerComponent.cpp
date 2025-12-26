@@ -2,28 +2,26 @@
 
 #include "Inventory/OWRPGInventoryManagerComponent.h"
 #include "Inventory/LyraInventoryItemInstance.h"
-#include "Inventory/InventoryFragment_Dimensions.h" // Make sure you have this file!
-#include "Inventory/OWRPGInventoryFunctionLibrary.h" // Helper to find fragments
+#include "Inventory/InventoryFragment_Dimensions.h" 
+#include "Inventory/OWRPGInventoryFragment_CoreStats.h" 
+#include "Inventory/OWRPGInventoryFragment_Pickup.h" 
+#include "Interaction/OWRPGWorldCollectable.h" 
+#include "Inventory/OWRPGInventoryFunctionLibrary.h" 
+#include "System/OWRPGGameplayTags.h"
 #include "Net/UnrealNetwork.h"
 #include "Engine/ActorChannel.h"
+#include "GameFramework/Pawn.h"
 
-// ==============================================================================
-// FAST ARRAY IMPLEMENTATION
-// ==============================================================================
-
+// --- Fast Array ---
 void FOWRPGInventoryEntry::PostReplicatedChange(const FOWRPGInventoryList& InArraySerializer)
 {
-	// Client-side hook: When data changes, update the visual cache
 	if (UOWRPGInventoryManagerComponent* Manager = InArraySerializer.OwnerComponent)
 	{
 		Manager->OnEntryChanged(this);
 	}
 }
 
-// ==============================================================================
-// MANAGER IMPLEMENTATION
-// ==============================================================================
-
+// --- Component ---
 UOWRPGInventoryManagerComponent::UOWRPGInventoryManagerComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -34,29 +32,54 @@ UOWRPGInventoryManagerComponent::UOWRPGInventoryManagerComponent(const FObjectIn
 void UOWRPGInventoryManagerComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-
 	DOREPLIFETIME(UOWRPGInventoryManagerComponent, InventoryList);
 	DOREPLIFETIME(UOWRPGInventoryManagerComponent, CursorItem);
+	DOREPLIFETIME(UOWRPGInventoryManagerComponent, Gold);
 }
 
-void UOWRPGInventoryManagerComponent::BeginPlay()
+void UOWRPGInventoryManagerComponent::OnEntryChanged(FOWRPGInventoryEntry* Entry)
 {
-	Super::BeginPlay();
-
-	// Initialize the memory for the Local Cache
-	GridTiles.SetNum(Columns * Rows);
+	OnInventoryRefresh.Broadcast();
 }
 
-// ------------------------------------------------------------------------------
-// HELPERS
-// ------------------------------------------------------------------------------
+// ==============================================================================
+// INTERNAL HELPERS
+// ==============================================================================
 
-int32 UOWRPGInventoryManagerComponent::GetIndex(int32 X, int32 Y) const
+const FOWRPGInventoryEntry* UOWRPGInventoryManagerComponent::GetEntry(ULyraInventoryItemInstance* Item) const
 {
-	return (Y * Columns) + X;
+	if (!Item) return nullptr;
+	return InventoryList.Entries.FindByPredicate([&](const FOWRPGInventoryEntry& E) { return E.Item == Item; });
 }
 
-void UOWRPGInventoryManagerComponent::GetItemDimensions(const ULyraInventoryItemInstance* Item, int32& W, int32& H) const
+bool UOWRPGInventoryManagerComponent::Internal_RemoveItem(ULyraInventoryItemInstance* Item)
+{
+	int32 Idx = InventoryList.Entries.IndexOfByPredicate([&](const FOWRPGInventoryEntry& E) { return E.Item == Item; });
+	if (Idx != INDEX_NONE)
+	{
+		InventoryList.Entries.RemoveAt(Idx);
+		InventoryList.MarkArrayDirty();
+		return true;
+	}
+	return false;
+}
+
+bool UOWRPGInventoryManagerComponent::Internal_AddItemInstance(ULyraInventoryItemInstance* Item, int32 X, int32 Y, bool bRotated)
+{
+	if (!Item) return false;
+
+	FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
+	NewEntry.Item = Item;
+	NewEntry.X = X;
+	NewEntry.Y = Y;
+	NewEntry.bRotated = bRotated;
+
+	InventoryList.MarkItemDirty(NewEntry);
+	InventoryList.MarkArrayDirty();
+	return true;
+}
+
+void UOWRPGInventoryManagerComponent::GetItemDimensions(const ULyraInventoryItemInstance* Item, int32& W, int32& H, bool bRotated) const
 {
 	W = 1; H = 1;
 	if (!Item) return;
@@ -67,294 +90,461 @@ void UOWRPGInventoryManagerComponent::GetItemDimensions(const ULyraInventoryItem
 		W = Frag->Width;
 		H = Frag->Height;
 	}
+	if (bRotated) { int32 T = W; W = H; H = T; }
 }
 
-// ------------------------------------------------------------------------------
-// SERVER LOGIC (Pickup / Place / Swap)
-// ------------------------------------------------------------------------------
-
-void UOWRPGInventoryManagerComponent::Debug_AddItem(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 X, int32 Y)
+TArray<ULyraInventoryItemInstance*> UOWRPGInventoryManagerComponent::GetItemsInRect(int32 TargetX, int32 TargetY, int32 RectW, int32 RectH, ULyraInventoryItemInstance* ExcludeItem) const
 {
-	if (!ItemDef) return;
-
-	// 1. Create the Object (Empty)
-	ULyraInventoryItemInstance* NewItem = NewObject<ULyraInventoryItemInstance>(GetOwner());
-
-	// 2. Set the "ItemDef" property using Reflection (Bypassing 'private')
-	// We look for the property by name "ItemDef" and set the value manually.
-	static FProperty* ItemDefProp = FindFProperty<FProperty>(ULyraInventoryItemInstance::StaticClass(), TEXT("ItemDef"));
-	if (ItemDefProp)
-	{
-		// For TSubclassOf, it's stored as a UClass* in memory
-		UClass* DefClass = *ItemDef;
-
-		// This helper sets the property value on the NewItem instance
-		// Note: FObjectPropertyBase handles TSubclassOf
-		if (FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(ItemDefProp))
-		{
-			ObjProp->SetObjectPropertyValue_InContainer(NewItem, DefClass);
-		}
-	}
-
-	// OR (Simpler Option if you decide to modify source later):
-	// NewItem->SetItemDef(ItemDef); 
-
-	// 3. Add to Grid logic
-	FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
-	NewEntry.Item = NewItem;
-	NewEntry.X = X;
-	NewEntry.Y = Y;
-
-	InventoryList.MarkItemDirty(NewEntry);
-	InventoryList.MarkArrayDirty();
-	RebuildCache();
-}
-
-// ------------------------------------------------------------------------------
-// CACHE MANAGEMENT (The 0.03ms Rebuild)
-// ------------------------------------------------------------------------------
-
-void UOWRPGInventoryManagerComponent::OnEntryChanged(FOWRPGInventoryEntry* Entry)
-{
-	RebuildCache();
-}
-
-void UOWRPGInventoryManagerComponent::RebuildCache()
-{
-	// 1. Clear Cache
-	for (FOWRPGInventoryTile& Tile : GridTiles)
-	{
-		Tile.Item = nullptr;
-		Tile.bIsHead = false;
-	}
-
-	if (GridTiles.Num() != Columns * Rows)
-	{
-		GridTiles.SetNum(Columns * Rows);
-	}
-
-	// 2. Re-Paint Items
+	TArray<ULyraInventoryItemInstance*> Overlaps;
 	for (const FOWRPGInventoryEntry& Entry : InventoryList.Entries)
 	{
-		if (!Entry.Item || Entry.X < 0 || Entry.Y < 0) continue;
+		if (!Entry.Item || Entry.Item == ExcludeItem) continue;
 
-		int32 W, H;
-		GetItemDimensions(Entry.Item, W, H);
+		int32 EntryW, EntryH;
+		GetItemDimensions(Entry.Item, EntryW, EntryH, Entry.bRotated);
 
-		for (int32 r = 0; r < H; r++)
+		bool bOverlapX = (TargetX < Entry.X + EntryW) && (TargetX + RectW > Entry.X);
+		bool bOverlapY = (TargetY < Entry.Y + EntryH) && (TargetY + RectH > Entry.Y);
+
+		if (bOverlapX && bOverlapY)
 		{
-			for (int32 c = 0; c < W; c++)
-			{
-				int32 Index = GetIndex(Entry.X + c, Entry.Y + r);
-				if (GridTiles.IsValidIndex(Index))
-				{
-					GridTiles[Index].Item = Entry.Item;
-					GridTiles[Index].bIsHead = (r == 0 && c == 0);
-				}
-			}
+			Overlaps.Add(Entry.Item);
 		}
 	}
-
-	// 3. Notify UI
-	OnInventoryVisualsChanged.Broadcast();
+	return Overlaps;
 }
 
-bool UOWRPGInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount)
-{
-	if (!ItemDef) return false;
-
-	// 1. Create the Instance (Using our Reflection workaround for now)
-	ULyraInventoryItemInstance* NewItem = NewObject<ULyraInventoryItemInstance>(GetOwner());
-
-	// Set ItemDef via Reflection
-	static FProperty* ItemDefProp = FindFProperty<FProperty>(ULyraInventoryItemInstance::StaticClass(), TEXT("ItemDef"));
-	if (ItemDefProp)
-	{
-		UClass* DefClass = *ItemDef;
-		if (FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(ItemDefProp))
-		{
-			ObjProp->SetObjectPropertyValue_InContainer(NewItem, DefClass);
-		}
-	}
-
-	// Set Stack Count (If your item supports it)
-	// NewItem->SetStatTagStack(TAG_Lyra_Inventory_Stack, StackCount); // (Uncomment if you have this tag)
-
-	// 2. Find a Spot
-	int32 TargetX, TargetY;
-	if (FindFreeSlot(NewItem, TargetX, TargetY))
-	{
-		// 3. Add to Data
-		FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
-		NewEntry.Item = NewItem;
-		NewEntry.X = TargetX;
-		NewEntry.Y = TargetY;
-
-		InventoryList.MarkItemDirty(NewEntry);
-		InventoryList.MarkArrayDirty();
-
-		// 4. Update Visuals
-		RebuildCache();
-		return true;
-	}
-
-	// Inventory Full!
-	// (Optional: You could destroy NewItem here to avoid garbage leaks, though GC handles it eventually)
-	return false;
-}
-
-bool UOWRPGInventoryManagerComponent::FindFreeSlot(ULyraInventoryItemInstance* Item, int32& OutX, int32& OutY) const
+bool UOWRPGInventoryManagerComponent::FindFreeSlot(ULyraInventoryItemInstance* Item, int32& OutX, int32& OutY)
 {
 	if (!Item) return false;
-
 	int32 W, H;
-	GetItemDimensions(Item, W, H);
-
-	// Brute Force Scan: Top-Left to Bottom-Right
-	// (Since we have local cache 'GridTiles', this is super fast even for 10,000 slots)
+	GetItemDimensions(Item, W, H, false);
 
 	for (int32 y = 0; y <= Rows - H; y++)
 	{
 		for (int32 x = 0; x <= Columns - W; x++)
 		{
-			// Check if item fits at (x,y)
-			bool bFits = true;
-
-			// Inner Loop: Check the rect for the item
-			for (int32 ItemY = 0; ItemY < H; ItemY++)
+			if (GetItemsInRect(x, y, W, H, nullptr).Num() == 0)
 			{
-				for (int32 ItemX = 0; ItemX < W; ItemX++)
-				{
-					int32 Index = GetIndex(x + ItemX, y + ItemY);
-
-					// If slot is occupied by ANY item, we can't fit here
-					if (GridTiles.IsValidIndex(Index) && GridTiles[Index].Item != nullptr)
-					{
-						bFits = false;
-						break;
-					}
-				}
-				if (!bFits) break;
-			}
-
-			if (bFits)
-			{
-				OutX = x;
-				OutY = y;
-				return true; // Found a spot!
+				OutX = x; OutY = y; return true;
 			}
 		}
 	}
-
-	return false; // No space found
-}
-
-void UOWRPGInventoryManagerComponent::OnRep_InventoryList()
-{
-	// Client received data -> Rebuild the visual cache
-	RebuildCache();
+	return false;
 }
 
 // ==============================================================================
-// SERVER RPC IMPLEMENTATION
+// ADD ITEM (SMART STACKING)
 // ==============================================================================
 
-bool UOWRPGInventoryManagerComponent::ServerPickupItem_Validate(ULyraInventoryItemInstance* Item)
+bool UOWRPGInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount)
 {
-	return true; // Add anti-cheat checks here later
-}
+	if (!GetOwner()->HasAuthority() || !ItemDef || StackCount <= 0) return false;
 
-void UOWRPGInventoryManagerComponent::ServerPickupItem_Implementation(ULyraInventoryItemInstance* Item)
-{
-	// ... (Paste your EXACT existing ServerPickupItem logic here) ...
-	// The logic inside is correct, we just moved it into the _Implementation function.
-
-	if (!Item || CursorItem) return;
-
-	int32 FoundIndex = -1;
-	for (int32 i = 0; i < InventoryList.Entries.Num(); i++)
+	// 1. Determine Max Stack
+	int32 MaxStack = 1;
+	const ULyraInventoryItemDefinition* DefCDO = GetDefault<ULyraInventoryItemDefinition>(ItemDef);
+	if (const UOWRPGInventoryFragment_CoreStats* StatsFrag = UOWRPGInventoryFunctionLibrary::FindItemDefinitionFragment<UOWRPGInventoryFragment_CoreStats>(DefCDO))
 	{
-		if (InventoryList.Entries[i].Item == Item)
+		MaxStack = StatsFrag->MaxStack;
+	}
+
+	// 2. PASS 1: Fill Existing Stacks
+	// FIX: Removed 'const' so we can call MarkItemDirty
+	for (FOWRPGInventoryEntry& Entry : InventoryList.Entries)
+	{
+		if (StackCount <= 0) break;
+		if (!Entry.Item) continue;
+
+		if (Entry.Item->GetItemDef() != ItemDef) continue;
+
+		int32 CurrentStack = 0;
+		static UFunction* GetStackFunc = Entry.Item->FindFunction(TEXT("GetStatTagStackCount"));
+		if (GetStackFunc)
 		{
-			FoundIndex = i;
-			break;
+			struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+			FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+			Entry.Item->ProcessEvent(GetStackFunc, &Params);
+			CurrentStack = Params.ReturnValue;
+		}
+
+		if (CurrentStack < MaxStack)
+		{
+			int32 Space = MaxStack - CurrentStack;
+			int32 Add = FMath::Min(StackCount, Space);
+
+			static UFunction* AddStackFunc = Entry.Item->FindFunction(TEXT("AddStatTagStack"));
+			if (AddStackFunc)
+			{
+				struct FParams { FGameplayTag Tag; int32 Count; };
+				FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, Add };
+				Entry.Item->ProcessEvent(AddStackFunc, &Params);
+			}
+
+			StackCount -= Add;
+			InventoryList.MarkItemDirty(Entry); // Now works because Entry is not const
 		}
 	}
 
-	if (FoundIndex != -1)
+	if (StackCount <= 0)
 	{
-		CursorItem = InventoryList.Entries[FoundIndex].Item;
-		InventoryList.Entries.RemoveAt(FoundIndex);
 		InventoryList.MarkArrayDirty();
-		RebuildCache();
+		return true;
 	}
-}
 
-bool UOWRPGInventoryManagerComponent::ServerPlaceItem_Validate(int32 TargetX, int32 TargetY)
-{
+	// 3. PASS 2: Create New Stacks
+	bool bAddedAny = false;
+
+	while (StackCount > 0)
+	{
+		int32 AmountForThisSlot = FMath::Min(StackCount, MaxStack);
+
+		ULyraInventoryItemInstance* NewItem = NewObject<ULyraInventoryItemInstance>(GetOwner());
+		static FProperty* ItemDefProp = FindFProperty<FProperty>(ULyraInventoryItemInstance::StaticClass(), TEXT("ItemDef"));
+		if (ItemDefProp)
+		{
+			UClass* DefClass = *ItemDef;
+			if (FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(ItemDefProp))
+			{
+				ObjProp->SetObjectPropertyValue_InContainer(NewItem, DefClass);
+			}
+		}
+
+		static UFunction* AddStackFunc = NewItem->FindFunction(TEXT("AddStatTagStack"));
+		if (AddStackFunc)
+		{
+			struct FParams { FGameplayTag Tag; int32 Count; };
+			FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, AmountForThisSlot };
+			NewItem->ProcessEvent(AddStackFunc, &Params);
+		}
+
+		int32 TargetX, TargetY;
+		if (FindFreeSlot(NewItem, TargetX, TargetY))
+		{
+			Internal_AddItemInstance(NewItem, TargetX, TargetY, false);
+			StackCount -= AmountForThisSlot;
+			bAddedAny = true;
+		}
+		else
+		{
+			SpawnItemInWorld(NewItem, StackCount);
+			return bAddedAny;
+		}
+	}
+
 	return true;
 }
 
-void UOWRPGInventoryManagerComponent::ServerPlaceItem_Implementation(int32 TargetX, int32 TargetY)
+// ==============================================================================
+// PLAYER ACTIONS
+// ==============================================================================
+
+bool UOWRPGInventoryManagerComponent::ServerTransferFrom_Validate(UOWRPGInventoryManagerComponent* SourceManager, ULyraInventoryItemInstance* SourceItem, int32 DestX, int32 DestY, bool bRotated) { return true; }
+void UOWRPGInventoryManagerComponent::ServerTransferFrom_Implementation(UOWRPGInventoryManagerComponent* SourceManager, ULyraInventoryItemInstance* SourceItem, int32 DestX, int32 DestY, bool bRotated)
 {
-	// ... (Paste your EXACT existing ServerPlaceItem logic here) ...
-	// NOTE: Make sure you use the logic that handles Swapping!
-
-	if (!CursorItem) return;
-
-	int32 W, H;
-	GetItemDimensions(CursorItem, W, H);
-
-	if (TargetX < 0 || TargetY < 0 || (TargetX + W) > Columns || (TargetY + H) > Rows) return;
-
-	// Collision Scan
-	TArray<ULyraInventoryItemInstance*> Overlaps;
-	for (int32 r = 0; r < H; r++)
+	if (!SourceManager || !SourceItem) return;
+	if (SourceManager == this)
 	{
-		for (int32 c = 0; c < W; c++)
-		{
-			int32 Index = GetIndex(TargetX + c, TargetY + r);
-			if (GridTiles.IsValidIndex(Index) && GridTiles[Index].Item != nullptr)
-			{
-				Overlaps.AddUnique(GridTiles[Index].Item);
-			}
-		}
+		ServerAttemptMove(SourceItem, DestX, DestY, bRotated);
+		return;
 	}
 
-	// Logic
+	const FOWRPGInventoryEntry* SourceEntry = SourceManager->GetEntry(SourceItem);
+	if (!SourceEntry) return;
+
+	int32 OriginalSrcX = SourceEntry->X;
+	int32 OriginalSrcY = SourceEntry->Y;
+	bool OriginalSrcRot = SourceEntry->bRotated;
+
+	int32 W, H;
+	GetItemDimensions(SourceItem, W, H, bRotated);
+	if (DestX < 0 || DestY < 0 || (DestX + W) > Columns || (DestY + H) > Rows) return;
+
+	TArray<ULyraInventoryItemInstance*> Overlaps = GetItemsInRect(DestX, DestY, W, H, nullptr);
+
 	if (Overlaps.Num() == 0)
 	{
-		// Place
-		FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
-		NewEntry.Item = CursorItem;
-		NewEntry.X = TargetX;
-		NewEntry.Y = TargetY;
-		InventoryList.MarkItemDirty(NewEntry);
-		InventoryList.MarkArrayDirty();
-		CursorItem = nullptr;
+		// EMPTY -> PLACE
+		if (SourceManager->Internal_RemoveItem(SourceItem))
+		{
+			Internal_AddItemInstance(SourceItem, DestX, DestY, bRotated);
+		}
 	}
 	else if (Overlaps.Num() == 1)
 	{
-		// Swap
-		ULyraInventoryItemInstance* OtherItem = Overlaps[0];
-		int32 OtherIndex = -1;
-		for (int32 i = 0; i < InventoryList.Entries.Num(); i++)
+		ULyraInventoryItemInstance* DestItem = Overlaps[0];
+
+		// --- STACKING CHECK ---
+		if (DestItem->GetItemDef() == SourceItem->GetItemDef())
 		{
-			if (InventoryList.Entries[i].Item == OtherItem) { OtherIndex = i; break; }
+			// 1. Get Stats
+			int32 SrcStack = 0;
+			int32 DstStack = 0;
+			int32 MaxStack = 1;
+
+			// Get MaxStack
+			const ULyraInventoryItemDefinition* DefCDO = GetDefault<ULyraInventoryItemDefinition>(DestItem->GetItemDef());
+			if (const UOWRPGInventoryFragment_CoreStats* StatsFrag = UOWRPGInventoryFunctionLibrary::FindItemDefinitionFragment<UOWRPGInventoryFragment_CoreStats>(DefCDO))
+			{
+				MaxStack = StatsFrag->MaxStack;
+			}
+
+			// Get Counts
+			static UFunction* GetStackFunc = SourceItem->FindFunction(TEXT("GetStatTagStackCount"));
+			if (GetStackFunc)
+			{
+				struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+				FParams ParamsSrc = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+				SourceItem->ProcessEvent(GetStackFunc, &ParamsSrc);
+				SrcStack = ParamsSrc.ReturnValue;
+
+				FParams ParamsDst = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+				DestItem->ProcessEvent(GetStackFunc, &ParamsDst);
+				DstStack = ParamsDst.ReturnValue;
+			}
+
+			// 2. Transfer
+			if (DstStack < MaxStack)
+			{
+				int32 Space = MaxStack - DstStack;
+				int32 MoveAmount = FMath::Min(SrcStack, Space);
+
+				if (MoveAmount > 0)
+				{
+					// Add to Dest
+					static UFunction* AddStackFunc = DestItem->FindFunction(TEXT("AddStatTagStack"));
+					if (AddStackFunc)
+					{
+						struct FParams { FGameplayTag Tag; int32 Count; };
+						FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, MoveAmount };
+						DestItem->ProcessEvent(AddStackFunc, &Params);
+					}
+
+					// Remove from Source
+					if (MoveAmount >= SrcStack)
+					{
+						SourceManager->Internal_RemoveItem(SourceItem);
+					}
+					else
+					{
+						static UFunction* RemoveStackFunc = SourceItem->FindFunction(TEXT("RemoveStatTagStack"));
+						if (RemoveStackFunc)
+						{
+							struct FParams { FGameplayTag Tag; int32 Count; };
+							FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, MoveAmount };
+							SourceItem->ProcessEvent(RemoveStackFunc, &Params);
+						}
+						// Mark Source Entry Dirty
+						if (const FOWRPGInventoryEntry* SrcE = SourceManager->GetEntry(SourceItem))
+						{
+							FOWRPGInventoryEntry* MutableSrcE = const_cast<FOWRPGInventoryEntry*>(SrcE);
+							SourceManager->InventoryList.MarkItemDirty(*MutableSrcE);
+						}
+					}
+
+					// Mark Dest Entry Dirty
+					if (const FOWRPGInventoryEntry* DstE = GetEntry(DestItem))
+					{
+						FOWRPGInventoryEntry* MutableDstE = const_cast<FOWRPGInventoryEntry*>(DstE);
+						InventoryList.MarkItemDirty(*MutableDstE);
+					}
+				}
+			}
 		}
-
-		if (OtherIndex != -1)
+		else
 		{
-			InventoryList.Entries.RemoveAt(OtherIndex);
+			// --- SWAP ---
+			int32 B_W, B_H;
+			SourceManager->GetItemDimensions(DestItem, B_W, B_H, OriginalSrcRot);
 
-			FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
-			NewEntry.Item = CursorItem;
-			NewEntry.X = TargetX;
-			NewEntry.Y = TargetY;
-			CursorItem = OtherItem; // Swap hands
-			InventoryList.MarkArrayDirty();
+			if (OriginalSrcX < 0 || OriginalSrcY < 0 || (OriginalSrcX + B_W) > SourceManager->Columns || (OriginalSrcY + B_H) > SourceManager->Rows) return;
+
+			TArray<ULyraInventoryItemInstance*> SourceOverlaps = SourceManager->GetItemsInRect(OriginalSrcX, OriginalSrcY, B_W, B_H, SourceItem);
+
+			if (SourceOverlaps.Num() == 0)
+			{
+				SourceManager->Internal_RemoveItem(SourceItem);
+				this->Internal_RemoveItem(DestItem);
+
+				this->Internal_AddItemInstance(SourceItem, DestX, DestY, bRotated);
+				SourceManager->Internal_AddItemInstance(DestItem, OriginalSrcX, OriginalSrcY, OriginalSrcRot);
+			}
+		}
+	}
+}
+
+// --- STANDARD ACTIONS ---
+
+void UOWRPGInventoryManagerComponent::Debug_AddItem(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount)
+{
+	AddItemDefinition(ItemDef, StackCount);
+}
+
+bool UOWRPGInventoryManagerComponent::ServerPickupItem_Validate(ULyraInventoryItemInstance* Item) { return true; }
+void UOWRPGInventoryManagerComponent::ServerPickupItem_Implementation(ULyraInventoryItemInstance* Item)
+{
+	if (!Item || CursorItem) return;
+	if (Internal_RemoveItem(Item))
+	{
+		CursorItem = Item;
+	}
+}
+
+bool UOWRPGInventoryManagerComponent::ServerAttemptMove_Validate(ULyraInventoryItemInstance* Item, int32 DestX, int32 DestY, bool bDestRotated) { return true; }
+void UOWRPGInventoryManagerComponent::ServerAttemptMove_Implementation(ULyraInventoryItemInstance* Item, int32 DestX, int32 DestY, bool bDestRotated)
+{
+	if (CursorItem && CursorItem == Item)
+	{
+		int32 W, H;
+		GetItemDimensions(CursorItem, W, H, bDestRotated);
+
+		if (DestX < 0 || DestY < 0 || (DestX + W) > Columns || (DestY + H) > Rows) return;
+
+		TArray<ULyraInventoryItemInstance*> Overlaps = GetItemsInRect(DestX, DestY, W, H, nullptr);
+
+		if (Overlaps.Num() == 0)
+		{
+			Internal_AddItemInstance(CursorItem, DestX, DestY, bDestRotated);
+			CursorItem = nullptr;
+		}
+		else if (Overlaps.Num() == 1)
+		{
+			ULyraInventoryItemInstance* OtherItem = Overlaps[0];
+			if (Internal_RemoveItem(OtherItem))
+			{
+				Internal_AddItemInstance(CursorItem, DestX, DestY, bDestRotated);
+				CursorItem = OtherItem;
+			}
+		}
+	}
+}
+
+bool UOWRPGInventoryManagerComponent::ServerDropFromCursor_Validate() { return true; }
+void UOWRPGInventoryManagerComponent::ServerDropFromCursor_Implementation()
+{
+	if (CursorItem)
+	{
+		int32 Stack = 1;
+		static UFunction* GetStackFunc = CursorItem->FindFunction(TEXT("GetStatTagStackCount"));
+		if (GetStackFunc)
+		{
+			struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+			FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+			CursorItem->ProcessEvent(GetStackFunc, &Params);
+			Stack = Params.ReturnValue;
+		}
+		SpawnItemInWorld(CursorItem, Stack);
+		CursorItem = nullptr;
+	}
+}
+
+bool UOWRPGInventoryManagerComponent::ServerDropFromGrid_Validate(ULyraInventoryItemInstance* Item) { return true; }
+void UOWRPGInventoryManagerComponent::ServerDropFromGrid_Implementation(ULyraInventoryItemInstance* Item)
+{
+	int32 Idx = InventoryList.Entries.IndexOfByPredicate([&](const FOWRPGInventoryEntry& E) { return E.Item == Item; });
+	if (Idx != INDEX_NONE)
+	{
+		int32 Stack = 1;
+		static UFunction* GetStackFunc = Item->FindFunction(TEXT("GetStatTagStackCount"));
+		if (GetStackFunc)
+		{
+			struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+			FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+			Item->ProcessEvent(GetStackFunc, &Params);
+			Stack = Params.ReturnValue;
+		}
+		SpawnItemInWorld(Item, Stack);
+		InventoryList.Entries.RemoveAt(Idx);
+		InventoryList.MarkArrayDirty();
+	}
+}
+
+bool UOWRPGInventoryManagerComponent::ServerSplitStack_Validate(ULyraInventoryItemInstance* Item, int32 AmountToSplit) { return true; }
+void UOWRPGInventoryManagerComponent::ServerSplitStack_Implementation(ULyraInventoryItemInstance* Item, int32 AmountToSplit)
+{
+	if (!Item || CursorItem || AmountToSplit <= 0) return;
+
+	int32 CurrentStack = 0;
+	static UFunction* GetStackFunc = Item->FindFunction(TEXT("GetStatTagStackCount"));
+	if (GetStackFunc)
+	{
+		struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+		FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, 0 };
+		Item->ProcessEvent(GetStackFunc, &Params);
+		CurrentStack = Params.ReturnValue;
+	}
+
+	if (CurrentStack <= AmountToSplit) return;
+
+	static UFunction* RemoveStackFunc = Item->FindFunction(TEXT("RemoveStatTagStack"));
+	if (RemoveStackFunc)
+	{
+		struct FParams { FGameplayTag Tag; int32 Count; };
+		FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, AmountToSplit };
+		Item->ProcessEvent(RemoveStackFunc, &Params);
+	}
+
+	ULyraInventoryItemInstance* NewItem = NewObject<ULyraInventoryItemInstance>(GetOwner());
+
+	static FProperty* ItemDefProp = FindFProperty<FProperty>(ULyraInventoryItemInstance::StaticClass(), TEXT("ItemDef"));
+	if (ItemDefProp)
+	{
+		TSubclassOf<ULyraInventoryItemDefinition> Def = Item->GetItemDef();
+		UClass* DefClass = *Def;
+		if (FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(ItemDefProp))
+		{
+			ObjProp->SetObjectPropertyValue_InContainer(NewItem, DefClass);
 		}
 	}
 
-	RebuildCache();
+	static UFunction* AddStackFunc = NewItem->FindFunction(TEXT("AddStatTagStack"));
+	if (AddStackFunc)
+	{
+		struct FParams { FGameplayTag Tag; int32 Count; };
+		FParams Params = { OWRPGGameplayTags::OWRPG_Inventory_Stack, AmountToSplit };
+		NewItem->ProcessEvent(AddStackFunc, &Params);
+	}
+
+	CursorItem = NewItem;
+	InventoryList.MarkArrayDirty();
+}
+
+bool UOWRPGInventoryManagerComponent::ServerEquipItem_Validate(ULyraInventoryItemInstance* Item) { return true; }
+void UOWRPGInventoryManagerComponent::ServerEquipItem_Implementation(ULyraInventoryItemInstance* Item)
+{
+	Internal_RemoveItem(Item);
+	UE_LOG(LogTemp, Warning, TEXT("Server: Item Equipped"));
+}
+
+float UOWRPGInventoryManagerComponent::GetTotalWeight() const { return 0.0f; }
+
+void UOWRPGInventoryManagerComponent::SpawnItemInWorld(ULyraInventoryItemInstance* Item, int32 StackCount)
+{
+	if (!GetOwner()) return;
+
+	APawn* Pawn = Cast<APawn>(GetOwner());
+	if (!Pawn) return;
+
+	const ULyraInventoryItemDefinition* Def = GetDefault<ULyraInventoryItemDefinition>(Item->GetItemDef());
+
+	if (const UOWRPGInventoryFragment_Pickup* PickupFrag = UOWRPGInventoryFunctionLibrary::FindItemDefinitionFragment<UOWRPGInventoryFragment_Pickup>(Def))
+	{
+		if (PickupFrag->PickupActorClass)
+		{
+			// Spawn in front of player
+			FVector SpawnLoc = Pawn->GetActorLocation() + (Pawn->GetActorForwardVector() * 100.0f) + FVector(0, 0, 50.0f);
+			FRotator RandomRot = Pawn->GetActorRotation();
+			RandomRot.Yaw += FMath::RandRange(-20.0f, 20.0f);
+
+			FTransform SpawnTransform(RandomRot, SpawnLoc);
+
+			if (AOWRPGWorldCollectable* NewPickup = GetWorld()->SpawnActorDeferred<AOWRPGWorldCollectable>(PickupFrag->PickupActorClass, SpawnTransform, Pawn, nullptr, ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn))
+			{
+				NewPickup->StaticItemDefinition = Item->GetItemDef();
+				NewPickup->StackCount = StackCount;
+				NewPickup->FinishSpawning(SpawnTransform);
+			}
+		}
+	}
+	UE_LOG(LogTemp, Warning, TEXT("Server: Spawned Item %s x%d"), *GetNameSafe(Item->GetItemDef()), StackCount);
 }

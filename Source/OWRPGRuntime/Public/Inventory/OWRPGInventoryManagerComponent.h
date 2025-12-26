@@ -11,7 +11,7 @@
 class UOWRPGInventoryManagerComponent;
 
 // -----------------------------------------------------------------------------------
-// 1. FAST ARRAY (The "Truth" - Networked)
+// FAST ARRAY
 // -----------------------------------------------------------------------------------
 
 USTRUCT(BlueprintType)
@@ -28,7 +28,9 @@ struct FOWRPGInventoryEntry : public FFastArraySerializerItem
 	UPROPERTY()
 	int32 Y = -1;
 
-	// Called on Client when this specific entry updates
+	UPROPERTY()
+	bool bRotated = false;
+
 	void PostReplicatedChange(const struct FOWRPGInventoryList& InArraySerializer);
 };
 
@@ -40,7 +42,6 @@ struct FOWRPGInventoryList : public FFastArraySerializer
 	UPROPERTY()
 	TArray<FOWRPGInventoryEntry> Entries;
 
-	// Automatically set to the component that owns this list
 	UPROPERTY(NotReplicated)
 	TObjectPtr<UOWRPGInventoryManagerComponent> OwnerComponent;
 
@@ -57,28 +58,10 @@ struct TStructOpsTypeTraits<FOWRPGInventoryList> : public TStructOpsTypeTraitsBa
 };
 
 // -----------------------------------------------------------------------------------
-// 2. LOCAL CACHE (The "Speed" - Non-Networked)
+// MANAGER COMPONENT
 // -----------------------------------------------------------------------------------
 
-USTRUCT(BlueprintType)
-struct FOWRPGInventoryTile
-{
-	GENERATED_BODY()
-
-	// Pointer to the item (read from Fast Array)
-	UPROPERTY(BlueprintReadOnly)
-	TObjectPtr<ULyraInventoryItemInstance> Item = nullptr;
-
-	// Is this the top-left tile of the item? (For UI rendering)
-	UPROPERTY(BlueprintReadOnly)
-	bool bIsHead = false;
-};
-
-// -----------------------------------------------------------------------------------
-// 3. THE MANAGER COMPONENT
-// -----------------------------------------------------------------------------------
-
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnInventoryVisualsChanged);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnInventoryRefresh);
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class OWRPGRUNTIME_API UOWRPGInventoryManagerComponent : public UActorComponent
@@ -88,71 +71,82 @@ class OWRPGRUNTIME_API UOWRPGInventoryManagerComponent : public UActorComponent
 public:
 	UOWRPGInventoryManagerComponent(const FObjectInitializer& ObjectInitializer);
 
-	// --- CONFIGURATION ---
+	// --- CONFIG ---
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Inventory")
 	int32 Columns = 10;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Inventory")
-	int32 Rows = 10;
+	int32 Rows = 6;
 
-	// --- STATE (Networked) ---
-	UPROPERTY(ReplicatedUsing = OnRep_InventoryList)
+	// --- STATE ---
+	UPROPERTY(Replicated)
 	FOWRPGInventoryList InventoryList;
 
-	// The item currently held on the cursor (Floating)
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Inventory")
-	TObjectPtr<ULyraInventoryItemInstance> CursorItem = nullptr;
+	TObjectPtr<ULyraInventoryItemInstance> CursorItem;
 
-	// --- STATE (Local Cache) ---
-	// The O(1) Lookup Table. Rebuilt automatically.
-	UPROPERTY(BlueprintReadOnly, Category = "Inventory")
-	TArray<FOWRPGInventoryTile> GridTiles;
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Inventory")
+	int32 Gold = 0;
 
-	// --- EVENTS ---
 	UPROPERTY(BlueprintAssignable)
-	FOnInventoryVisualsChanged OnInventoryVisualsChanged;
+	FOnInventoryRefresh OnInventoryRefresh;
 
-	// --- ACTIONS API (Server Only) ---
+	// --- CROSS-INVENTORY TRANSFER (New) ---
 
-	// Pick up an item from the grid (Move Grid -> Cursor)
+	// Called on the DESTINATION manager to pull an item from the SOURCE manager.
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
+	void ServerTransferFrom(UOWRPGInventoryManagerComponent* SourceManager, ULyraInventoryItemInstance* SourceItem, int32 DestX, int32 DestY, bool bRotated);
+
+	// --- SINGLE INVENTORY ACTIONS ---
+
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Inventory")
+	bool AddItemDefinition(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount = 1);
+
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
+	void ServerAttemptMove(ULyraInventoryItemInstance* Item, int32 DestX, int32 DestY, bool bDestRotated);
+
 	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
 	void ServerPickupItem(ULyraInventoryItemInstance* Item);
 
-	// Drop the cursor item into the grid (Move Cursor -> Grid)
 	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
-	void ServerPlaceItem(int32 TargetX, int32 TargetY);
+	void ServerDropFromGrid(ULyraInventoryItemInstance* Item);
 
-	// Tries to add an item definition to the first available slot (Auto-Loot)
-	// Returns true if successful
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Inventory")
-	bool AddItemDefinition(TSubclassOf<class ULyraInventoryItemDefinition> ItemDef, int32 StackCount = 1);
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
+	void ServerDropFromCursor();
 
-	// Helper to find the first empty space for an item
-	bool FindFreeSlot(ULyraInventoryItemInstance* Item, int32& OutX, int32& OutY) const;
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
+	void ServerSplitStack(ULyraInventoryItemInstance* Item, int32 AmountToSplit);
 
-	// Debug: Add item directly to grid
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Debug")
-	void Debug_AddItem(TSubclassOf<class ULyraInventoryItemDefinition> ItemDef, int32 X, int32 Y);
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
+	void ServerEquipItem(ULyraInventoryItemInstance* Item);
 
-	// --- INTERNAL / HELPERS ---
+	// --- HELPERS ---
+	UFUNCTION(BlueprintCallable, Category = "Inventory")
+	float GetTotalWeight() const;
 
-	// Called by Fast Array
+	UFUNCTION(BlueprintCallable, Category = "Inventory")
+	int32 GetTotalGold() const { return Gold; }
+
+	bool FindFreeSlot(ULyraInventoryItemInstance* Item, int32& OutX, int32& OutY);
+
+	// INTERNAL: Adds an item instance directly (used during transfer)
+	bool Internal_AddItemInstance(ULyraInventoryItemInstance* Item, int32 X, int32 Y, bool bRotated);
+
+	// INTERNAL: Removes item from list but does NOT destroy it
+	bool Internal_RemoveItem(ULyraInventoryItemInstance* Item);
+
+	// INTERNAL: Gets the entry data (X, Y)
+	const FOWRPGInventoryEntry* GetEntry(ULyraInventoryItemInstance* Item) const;
+
+	TArray<ULyraInventoryItemInstance*> GetItemsInRect(int32 X, int32 Y, int32 W, int32 H, ULyraInventoryItemInstance* ExcludeItem) const;
+	void GetItemDimensions(const ULyraInventoryItemInstance* Item, int32& W, int32& H, bool bRotated) const;
 	void OnEntryChanged(FOWRPGInventoryEntry* Entry);
 
-	// Rebuilds GridTiles from InventoryList
-	void RebuildCache();
-
-	// Helper: Convert X/Y to Index
-	int32 GetIndex(int32 X, int32 Y) const;
-
-	// Helper: Get Size of an item
-	void GetItemDimensions(const ULyraInventoryItemInstance* Item, int32& W, int32& H) const;
-
-	// Catch-all for network updates
-	UFUNCTION()
-	void OnRep_InventoryList();
+	// Debug
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Debug")
+	void Debug_AddItem(TSubclassOf<ULyraInventoryItemDefinition> ItemDef, int32 StackCount = 1);
 
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
-	virtual void BeginPlay() override;
+	void SpawnItemInWorld(ULyraInventoryItemInstance* Item, int32 StackCount);
 };

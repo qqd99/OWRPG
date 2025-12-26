@@ -9,10 +9,11 @@
 class UOWRPGInventoryManagerComponent;
 class UOWRPGInventoryItemWidget;
 class UCanvasPanel;
-class USizeBox;
+class UBorder;
 
 /**
- * The Grid Container. Handles Drag Over logic and Painting the Highlight.
+ * The Visual Grid.
+ * Handles Drag Over, Drop, and Rotation Input ('R' key).
  */
 UCLASS()
 class OWRPGRUNTIME_API UOWRPGInventoryGridWidget : public UUserWidget
@@ -20,15 +21,22 @@ class OWRPGRUNTIME_API UOWRPGInventoryGridWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// --- CONFIG ---
+	// --- DEPENDENCIES ---
 	UPROPERTY(BlueprintReadWrite, Category = "Inventory", meta = (ExposeOnSpawn = true))
 	TObjectPtr<UOWRPGInventoryManagerComponent> InventoryManager;
 
 	UPROPERTY(EditAnywhere, Category = "Inventory")
 	TSubclassOf<UOWRPGInventoryItemWidget> ItemWidgetClass;
 
+	// --- CONFIG ---
 	UPROPERTY(EditAnywhere, Category = "Inventory")
-	float SlotSize = 50.0f;
+	float TileSize = 50.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Inventory")
+	FLinearColor ValidDropColor = FLinearColor(0.0f, 1.0f, 0.0f, 0.3f);
+
+	UPROPERTY(EditAnywhere, Category = "Inventory")
+	FLinearColor InvalidDropColor = FLinearColor(1.0f, 0.0f, 0.0f, 0.3f);
 
 protected:
 	// --- WIDGET BINDINGS ---
@@ -36,23 +44,23 @@ protected:
 	TObjectPtr<UCanvasPanel> GridCanvas;
 
 	UPROPERTY(BlueprintReadOnly, meta = (BindWidgetOptional))
-	TObjectPtr<USizeBox> GridSizeBox;
+	TObjectPtr<UBorder> BackgroundBorder;
 
-	// --- STATE ---
+	// --- INTERNAL STATE ---
 	UPROPERTY()
-	TMap<TObjectPtr<class ULyraInventoryItemInstance>, TObjectPtr<UOWRPGInventoryItemWidget>> ActiveItemWidgets;
+	TMap<TObjectPtr<class ULyraInventoryItemInstance>, TObjectPtr<UOWRPGInventoryItemWidget>> ItemWidgets;
 
-	// --- DRAG HIGHLIGHT STATE ---
+	// Drag State
 	bool bIsDraggingOver = false;
 	bool bIsPlacementValid = false;
 
-	// Where is the mouse hovering? (Grid Coords)
+	// Rotation State (New)
+	bool bIsDraggingRotated = false;
+
 	int32 HoveredX = -1;
 	int32 HoveredY = -1;
-
-	// Cache the size of the item being dragged (so we don't query Manager every frame in OnPaint)
-	int32 CachedDraggedW = 1;
-	int32 CachedDraggedH = 1;
+	int32 DraggedW = 1;
+	int32 DraggedH = 1;
 
 public:
 	UFUNCTION(BlueprintCallable, Category = "Inventory")
@@ -63,8 +71,13 @@ public:
 
 protected:
 	virtual void NativeDestruct() override;
+
 	virtual int32 NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
+
 	virtual bool NativeOnDragOver(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
-	virtual bool NativeOnDrop(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
 	virtual void NativeOnDragLeave(const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
+	virtual bool NativeOnDrop(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
+
+	// Helper to flip dimensions if R is pressed
+	void CheckRotationInput();
 };

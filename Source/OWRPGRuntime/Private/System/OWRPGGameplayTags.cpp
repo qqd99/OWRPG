@@ -66,4 +66,7 @@ namespace OWRPGGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Race_Human, "OWRPG.Race.Human");
 	UE_DEFINE_GAMEPLAY_TAG(Race_RockPerson, "OWRPG.Race.RockPerson");
 	UE_DEFINE_GAMEPLAY_TAG(Race_Elf, "OWRPG.Race.Elf");
+
+	// --- INVENTORY TAGS ---
+	UE_DEFINE_GAMEPLAY_TAG(OWRPG_Inventory_Stack, "OWRPG.Inventory.Stack");
 }
