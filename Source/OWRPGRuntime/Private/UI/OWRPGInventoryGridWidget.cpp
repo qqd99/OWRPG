@@ -11,6 +11,7 @@
 #include "Rendering/DrawElements.h"
 #include "GameFramework/PlayerController.h" 
 #include "InputCoreTypes.h"
+#include <Components/SizeBox.h>
 
 void UOWRPGInventoryGridWidget::InitializeGrid(UOWRPGInventoryManagerComponent* InManager)
 {
@@ -41,11 +42,23 @@ void UOWRPGInventoryGridWidget::RefreshGrid()
 {
 	if (!InventoryManager || !GridCanvas || !ItemWidgetClass) return;
 
+	// 1. Calculate Required Pixel Size
+	float TotalWidth = InventoryManager->Columns * TileSize;
+	float TotalHeight = InventoryManager->Rows * TileSize;
+
+	// 2. Force the Canvas to this size
 	if (UCanvasPanelSlot* RootSlot = Cast<UCanvasPanelSlot>(GridCanvas->Slot))
 	{
-		RootSlot->SetSize(FVector2D(InventoryManager->Columns * TileSize, InventoryManager->Rows * TileSize));
+		RootSlot->SetSize(FVector2D(TotalWidth, TotalHeight));
 	}
-	SetDesiredSizeInViewport(FVector2D(InventoryManager->Columns * TileSize, InventoryManager->Rows * TileSize));
+
+	// 3. Force the Widget itself to this size (Dynamic resizing)
+	SetDesiredSizeInViewport(FVector2D(TotalWidth, TotalHeight));
+
+	if (USizeBox* RootSize = Cast<USizeBox>(GetRootWidget())) {
+	    RootSize->SetWidthOverride(TotalWidth);
+	    RootSize->SetHeightOverride(TotalHeight);
+	}
 
 	GridCanvas->ClearChildren();
 	ItemWidgets.Empty();
@@ -92,7 +105,7 @@ bool UOWRPGInventoryGridWidget::NativeOnDragOver(const FGeometry& InGeometry, co
 	UOWRPGInventoryDragDrop* DragOp = Cast<UOWRPGInventoryDragDrop>(InOperation);
 	if (!DragOp || !InventoryManager) return false;
 
-	// 1. Input Check
+	// 1. Rotation Input Check (If you implemented the 'R' key logic)
 	CheckRotationInput();
 
 	// 2. Determine Dimensions (Base + Rotation Flip)
@@ -104,12 +117,12 @@ bool UOWRPGInventoryGridWidget::NativeOnDragOver(const FGeometry& InGeometry, co
 	}
 	else
 	{
+		// Fallback if not cached
 		InventoryManager->GetItemDimensions(DragOp->DraggedItem, BaseW, BaseH, false);
 	}
 
 	// Apply Rotation Logic: If rotated, flip W and H
-	// We combine the Item's original rotation state with our toggle
-	bool bFinalRotated = (DragOp->bIsRotated != bIsDraggingRotated); // XOR logic: Flip if 'R' pressed
+	bool bFinalRotated = (DragOp->bIsRotated != bIsDraggingRotated);
 
 	if (bFinalRotated)
 	{
@@ -122,26 +135,48 @@ bool UOWRPGInventoryGridWidget::NativeOnDragOver(const FGeometry& InGeometry, co
 		DraggedH = BaseH;
 	}
 
-	// 3. Grid Position
+	// 3. Calculate Grid Index based on Mouse Position
 	FVector2D LocalPos = InGeometry.AbsoluteToLocal(InDragDropEvent.GetScreenSpacePosition());
+
+	// Offset so we drag from the "Click Point" relative to the item, not always top-left
 	LocalPos -= DragOp->DragOffset;
 
-	HoveredX = FMath::FloorToInt(LocalPos.X / TileSize);
-	HoveredY = FMath::FloorToInt(LocalPos.Y / TileSize);
+	int32 NewHoveredX = FMath::FloorToInt(LocalPos.X / TileSize);
+	int32 NewHoveredY = FMath::FloorToInt(LocalPos.Y / TileSize);
 
-	// 4. Validate
-	if (HoveredX < 0 || HoveredY < 0 || (HoveredX + DraggedW) > InventoryManager->Columns || (HoveredY + DraggedH) > InventoryManager->Rows)
+	// 4. BOUNDARY CHECK (The Fix)
+	// If the top-left corner of the drag is outside the grid, stop drawing immediately.
+	if (NewHoveredX < 0 || NewHoveredY < 0 ||
+		NewHoveredX >= InventoryManager->Columns ||
+		NewHoveredY >= InventoryManager->Rows)
 	{
-		bIsPlacementValid = false;
+		bIsDraggingOver = false; // Prevents NativePaint from drawing the box
+		return false;            // Reject the drag over event
+	}
+
+	// 5. Update State
+	HoveredX = NewHoveredX;
+	HoveredY = NewHoveredY;
+
+	// 6. Check Placement Validity (Logic for Red/Green)
+	// Even if the cursor is valid (e.g. at 9,9), the item might be huge (2x2) and go out of bounds.
+	bool bOutOfBounds = (HoveredX + DraggedW) > InventoryManager->Columns || (HoveredY + DraggedH) > InventoryManager->Rows;
+
+	if (bOutOfBounds)
+	{
+		bIsPlacementValid = false; // Draw RED
 	}
 	else
 	{
-		// "Tetris" Predictive Check
+		// Check "Tetris" overlaps (Predictive)
+		// We pass 'DragOp->DraggedItem' as the item to Exclude (ignore self)
 		TArray<ULyraInventoryItemInstance*> Overlaps = InventoryManager->GetItemsInRect(HoveredX, HoveredY, DraggedW, DraggedH, DragOp->DraggedItem);
-		bIsPlacementValid = (Overlaps.Num() <= 1); // 0 = Place, 1 = Swap, >1 = Fail
+
+		// Logic: 0 overlaps = Green (Place). 1 overlap = Green (Swap). >1 overlaps = Red (Blocked).
+		bIsPlacementValid = (Overlaps.Num() <= 1);
 	}
 
-	bIsDraggingOver = true;
+	bIsDraggingOver = true; // Tells NativePaint to draw the box
 	return true;
 }
 

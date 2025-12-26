@@ -49,6 +49,9 @@ struct FOWRPGInventoryList : public FFastArraySerializer
 	{
 		return FFastArraySerializer::FastArrayDeltaSerialize<FOWRPGInventoryEntry, FOWRPGInventoryList>(Entries, DeltaParms, *this);
 	}
+
+	// CRITICAL FIX: Ensures UI updates on Add/Remove (Client Side)
+	void PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
 };
 
 template<>
@@ -91,9 +94,18 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FOnInventoryRefresh OnInventoryRefresh;
 
-	// --- CROSS-INVENTORY TRANSFER (New) ---
+	// --- LIFECYCLE ---
+	virtual void BeginPlay() override;
+	virtual void OnRegister() override;
 
-	// Called on the DESTINATION manager to pull an item from the SOURCE manager.
+	// --- REPLICATION ---
+	// Helper to ensure an item is replicating
+	void RegisterReplication(ULyraInventoryItemInstance* Item);
+
+	// Helper to stop replicating an item (e.g. when dropped)
+	void UnregisterReplication(ULyraInventoryItemInstance* Item);
+
+	// --- CROSS-INVENTORY TRANSFER ---
 	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "Inventory")
 	void ServerTransferFrom(UOWRPGInventoryManagerComponent* SourceManager, ULyraInventoryItemInstance* SourceItem, int32 DestX, int32 DestY, bool bRotated);
 
@@ -129,7 +141,7 @@ public:
 
 	bool FindFreeSlot(ULyraInventoryItemInstance* Item, int32& OutX, int32& OutY);
 
-	// INTERNAL: Adds an item instance directly (used during transfer)
+	// INTERNAL: Adds an item instance directly
 	bool Internal_AddItemInstance(ULyraInventoryItemInstance* Item, int32 X, int32 Y, bool bRotated);
 
 	// INTERNAL: Removes item from list but does NOT destroy it

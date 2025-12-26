@@ -12,20 +12,40 @@
 #include "Engine/ActorChannel.h"
 #include "GameFramework/Pawn.h"
 
-// --- Fast Array ---
+// ==============================================================================
+// FAST ARRAY
+// ==============================================================================
+
 void FOWRPGInventoryEntry::PostReplicatedChange(const FOWRPGInventoryList& InArraySerializer)
 {
+	// This handles changes to existing items (Moves/Stack Updates)
 	if (UOWRPGInventoryManagerComponent* Manager = InArraySerializer.OwnerComponent)
 	{
 		Manager->OnEntryChanged(this);
 	}
 }
 
-// --- Component ---
+void FOWRPGInventoryList::PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters)
+{
+	// This handles ALL updates, including Adds and Removes, which PostReplicatedChange misses.
+	if (OwnerComponent)
+	{
+		OwnerComponent->OnInventoryRefresh.Broadcast();
+	}
+}
+
+// ==============================================================================
+// COMPONENT CORE
+// ==============================================================================
+
 UOWRPGInventoryManagerComponent::UOWRPGInventoryManagerComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 	SetIsReplicatedByDefault(true);
+
+	// CRITICAL FIX: Enable the modern replication system
+	bReplicateUsingRegisteredSubObjectList = true;
+
 	InventoryList.OwnerComponent = this;
 }
 
@@ -35,6 +55,36 @@ void UOWRPGInventoryManagerComponent::GetLifetimeReplicatedProps(TArray<FLifetim
 	DOREPLIFETIME(UOWRPGInventoryManagerComponent, InventoryList);
 	DOREPLIFETIME(UOWRPGInventoryManagerComponent, CursorItem);
 	DOREPLIFETIME(UOWRPGInventoryManagerComponent, Gold);
+}
+
+void UOWRPGInventoryManagerComponent::RegisterReplication(ULyraInventoryItemInstance* Item)
+{
+	if (Item && GetOwner()->HasAuthority())
+	{
+		AddReplicatedSubObject(Item);
+	}
+}
+
+void UOWRPGInventoryManagerComponent::UnregisterReplication(ULyraInventoryItemInstance* Item)
+{
+	if (Item && GetOwner()->HasAuthority())
+	{
+		RemoveReplicatedSubObject(Item);
+	}
+}
+
+void UOWRPGInventoryManagerComponent::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// CRITICAL FIX: Ensure Client knows who owns the list, or OnRep won't trigger UI updates
+	InventoryList.OwnerComponent = this;
+}
+
+void UOWRPGInventoryManagerComponent::OnRegister()
+{
+	Super::OnRegister();
+	InventoryList.OwnerComponent = this;
 }
 
 void UOWRPGInventoryManagerComponent::OnEntryChanged(FOWRPGInventoryEntry* Entry)
@@ -67,6 +117,9 @@ bool UOWRPGInventoryManagerComponent::Internal_RemoveItem(ULyraInventoryItemInst
 bool UOWRPGInventoryManagerComponent::Internal_AddItemInstance(ULyraInventoryItemInstance* Item, int32 X, int32 Y, bool bRotated)
 {
 	if (!Item) return false;
+
+	// FIX: Register the object for replication immediately
+	RegisterReplication(Item);
 
 	FOWRPGInventoryEntry& NewEntry = InventoryList.Entries.AddDefaulted_GetRef();
 	NewEntry.Item = Item;
@@ -150,7 +203,6 @@ bool UOWRPGInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInvento
 	}
 
 	// 2. PASS 1: Fill Existing Stacks
-	// FIX: Removed 'const' so we can call MarkItemDirty
 	for (FOWRPGInventoryEntry& Entry : InventoryList.Entries)
 	{
 		if (StackCount <= 0) break;
@@ -182,7 +234,7 @@ bool UOWRPGInventoryManagerComponent::AddItemDefinition(TSubclassOf<ULyraInvento
 			}
 
 			StackCount -= Add;
-			InventoryList.MarkItemDirty(Entry); // Now works because Entry is not const
+			InventoryList.MarkItemDirty(Entry);
 		}
 	}
 
@@ -267,6 +319,10 @@ void UOWRPGInventoryManagerComponent::ServerTransferFrom_Implementation(UOWRPGIn
 		// EMPTY -> PLACE
 		if (SourceManager->Internal_RemoveItem(SourceItem))
 		{
+			// Source stops replicating it
+			SourceManager->UnregisterReplication(SourceItem);
+
+			// Dest adds it (Internal_AddItemInstance calls Register automatically)
 			Internal_AddItemInstance(SourceItem, DestX, DestY, bRotated);
 		}
 	}
@@ -505,6 +561,8 @@ void UOWRPGInventoryManagerComponent::ServerSplitStack_Implementation(ULyraInven
 		NewItem->ProcessEvent(AddStackFunc, &Params);
 	}
 
+	RegisterReplication(NewItem);
+
 	CursorItem = NewItem;
 	InventoryList.MarkArrayDirty();
 }
@@ -531,7 +589,6 @@ void UOWRPGInventoryManagerComponent::SpawnItemInWorld(ULyraInventoryItemInstanc
 	{
 		if (PickupFrag->PickupActorClass)
 		{
-			// Spawn in front of player
 			FVector SpawnLoc = Pawn->GetActorLocation() + (Pawn->GetActorForwardVector() * 100.0f) + FVector(0, 0, 50.0f);
 			FRotator RandomRot = Pawn->GetActorRotation();
 			RandomRot.Yaw += FMath::RandRange(-20.0f, 20.0f);
@@ -546,5 +603,6 @@ void UOWRPGInventoryManagerComponent::SpawnItemInWorld(ULyraInventoryItemInstanc
 			}
 		}
 	}
+	UnregisterReplication(Item);
 	UE_LOG(LogTemp, Warning, TEXT("Server: Spawned Item %s x%d"), *GetNameSafe(Item->GetItemDef()), StackCount);
 }
