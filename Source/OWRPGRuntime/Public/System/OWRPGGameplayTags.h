@@ -23,6 +23,10 @@ namespace OWRPGGameplayTags
 	OWRPGRUNTIME_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Cheat_UnlimitedStamina);
 	OWRPGRUNTIME_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Cheat_GodMode);
 
+	// -- ABILITY --
+	OWRPGRUNTIME_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_Drop);
+	OWRPGRUNTIME_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_Inventory);
+
 	// ---------------------------------------------------------
 	// --- ITEM SYSTEM (The New Logic) ---
 	// ---------------------------------------------------------

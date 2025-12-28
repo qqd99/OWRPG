@@ -3,66 +3,31 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "CommonUserWidget.h"
 #include "OWRPGInventoryGridWidget.generated.h"
 
 class UOWRPGInventoryManagerComponent;
-class UOWRPGInventoryItemWidget;
 class UCanvasPanel;
+class USizeBox;
+class UOWRPGInventoryItemWidget;
+class ULyraInventoryItemInstance;
 class UBorder;
 
 /**
- * The Visual Grid.
- * Handles Drag Over, Drop, and Rotation Input ('R' key).
+ * Spatial Grid with Dynamic Resizing and Widget Pooling.
+ * O(N) refresh complexity instead of O(Widgets).
  */
 UCLASS()
-class OWRPGRUNTIME_API UOWRPGInventoryGridWidget : public UUserWidget
+class OWRPGRUNTIME_API UOWRPGInventoryGridWidget : public UCommonUserWidget
 {
 	GENERATED_BODY()
 
 public:
-	// --- DEPENDENCIES ---
-	UPROPERTY(BlueprintReadWrite, Category = "Inventory", meta = (ExposeOnSpawn = true))
-	TObjectPtr<UOWRPGInventoryManagerComponent> InventoryManager;
+	// --- SETUP ---
 
-	UPROPERTY(EditAnywhere, Category = "Inventory")
-	TSubclassOf<UOWRPGInventoryItemWidget> ItemWidgetClass;
-
-	// --- CONFIG ---
-	UPROPERTY(EditAnywhere, Category = "Inventory")
-	float TileSize = 50.0f;
-
-	UPROPERTY(EditAnywhere, Category = "Inventory")
-	FLinearColor ValidDropColor = FLinearColor(0.0f, 1.0f, 0.0f, 0.3f);
-
-	UPROPERTY(EditAnywhere, Category = "Inventory")
-	FLinearColor InvalidDropColor = FLinearColor(1.0f, 0.0f, 0.0f, 0.3f);
-
-protected:
-	// --- WIDGET BINDINGS ---
-	UPROPERTY(BlueprintReadOnly, meta = (BindWidget))
-	TObjectPtr<UCanvasPanel> GridCanvas;
-
-	UPROPERTY(BlueprintReadOnly, meta = (BindWidgetOptional))
-	TObjectPtr<UBorder> BackgroundBorder;
-
-	// --- INTERNAL STATE ---
-	UPROPERTY()
-	TMap<TObjectPtr<class ULyraInventoryItemInstance>, TObjectPtr<UOWRPGInventoryItemWidget>> ItemWidgets;
-
-	// Drag State
-	bool bIsDraggingOver = false;
-	bool bIsPlacementValid = false;
-
-	// Rotation State (New)
-	bool bIsDraggingRotated = false;
-
-	int32 HoveredX = -1;
-	int32 HoveredY = -1;
-	int32 DraggedW = 1;
-	int32 DraggedH = 1;
-
-public:
+	/** * Binds this UI to a specific Manager (e.g., Player Inventory or Chest).
+	 * Automatically resizes the grid to fit the Manager's Column/Row count.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Inventory")
 	void InitializeGrid(UOWRPGInventoryManagerComponent* InManager);
 
@@ -70,14 +35,48 @@ public:
 	void RefreshGrid();
 
 protected:
+	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
-
-	virtual int32 NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
-
 	virtual bool NativeOnDragOver(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
-	virtual void NativeOnDragLeave(const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
 	virtual bool NativeOnDrop(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
+	virtual void NativeOnDragLeave(const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation) override;
 
-	// Helper to flip dimensions if R is pressed
-	void CheckRotationInput();
+	// --- CONFIG ---
+	UPROPERTY(EditAnywhere, Category = "Inventory")
+	float TileSize = 50.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Inventory")
+	TSubclassOf<UOWRPGInventoryItemWidget> ItemWidgetClass;
+
+	// --- COMPONENTS ---
+	UPROPERTY(meta = (BindWidget))
+	TObjectPtr<USizeBox> GridSizeBox;
+
+	UPROPERTY(meta = (BindWidget))
+	TObjectPtr<UCanvasPanel> GridCanvas;
+
+	UPROPERTY(meta = (BindWidgetOptional))
+	TObjectPtr<UCanvasPanel> BackgroundCanvas;
+
+	// The "Ghost" highlight. Add a Border named "DragHighlight" to W_InventoryGrid!
+	UPROPERTY(meta = (BindWidgetOptional))
+	TObjectPtr<UBorder> DragHighlight;
+
+	// --- POOLING SYSTEM ---
+	UPROPERTY()
+	TArray<TObjectPtr<UOWRPGInventoryItemWidget>> WidgetPool;
+
+	UPROPERTY()
+	TMap<TObjectPtr<ULyraInventoryItemInstance>, TObjectPtr<UOWRPGInventoryItemWidget>> ActiveItemWidgets;
+
+	UPROPERTY()
+	TObjectPtr<UOWRPGInventoryManagerComponent> InventoryManager;
+
+	// --- HELPERS ---
+	UOWRPGInventoryItemWidget* GetFreeWidget();
+	void DrawGridLines();
+
+	// Drag Preview
+	UPROPERTY()
+	TObjectPtr<UUserWidget> DragHighlightWidget;
 };

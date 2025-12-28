@@ -8,11 +8,102 @@
 #include "Equipment/LyraEquipmentInstance.h"
 #include "Inventory/OWRPGInventoryFragment_Traits.h"
 #include "Inventory/OWRPGInventoryFragment_CoreStats.h"
-#include "Inventory/OWRPGInventoryFragment_UI.h" // Added for Icon/Description
+#include "Inventory/OWRPGInventoryFragment_UI.h" 
 #include "GameFramework/Controller.h"
-#include "System/GameplayTagStack.h" // Required for Reflection cast
+#include "System/GameplayTagStack.h" 
 #include "UObject/UObjectGlobals.h"
 #include "Equipment/OWRPGVisualItemActor.h"
+#include "System/OWRPGGameplayTags.h"
+
+// --- FRAGMENT HELPERS ---
+
+const ULyraInventoryItemFragment* UOWRPGInventoryFunctionLibrary::FindItemDefinitionFragment(const ULyraInventoryItemDefinition* ItemDef, TSubclassOf<ULyraInventoryItemFragment> FragmentClass)
+{
+	if ((ItemDef != nullptr) && (FragmentClass != nullptr))
+	{
+		for (const ULyraInventoryItemFragment* Fragment : ItemDef->Fragments)
+		{
+			if (Fragment && Fragment->IsA(FragmentClass))
+			{
+				return Fragment;
+			}
+		}
+	}
+	return nullptr;
+}
+
+// --- STACKING REFLECTION HELPERS (Fix for LNK2019) ---
+
+int32 UOWRPGInventoryFunctionLibrary::GetItemStatsStackCount(ULyraInventoryItemInstance* Item)
+{
+	if (!Item) return 0;
+
+	// Use Reflection to find the function, since we can't link to it directly
+	static UFunction* Func = Item->FindFunction(FName("GetStatTagStackCount"));
+	if (Func)
+	{
+		struct FParams { FGameplayTag Tag; int32 ReturnValue; };
+		FParams Params;
+		Params.Tag = OWRPGGameplayTags::OWRPG_Inventory_Stack;
+		Params.ReturnValue = 0;
+
+		Item->ProcessEvent(Func, &Params);
+		return Params.ReturnValue;
+	}
+
+	// Fallback: If stack system isn't on item, return 1
+	return 1;
+}
+
+bool UOWRPGInventoryFunctionLibrary::HasItemStatsStack(ULyraInventoryItemInstance* Item)
+{
+	if (!Item) return false;
+
+	static UFunction* Func = Item->FindFunction(FName("HasStatTag"));
+	if (Func)
+	{
+		struct FParams { FGameplayTag Tag; bool ReturnValue; };
+		FParams Params;
+		Params.Tag = OWRPGGameplayTags::OWRPG_Inventory_Stack;
+		Params.ReturnValue = false;
+
+		Item->ProcessEvent(Func, &Params);
+		return Params.ReturnValue;
+	}
+	return false;
+}
+
+void UOWRPGInventoryFunctionLibrary::AddItemStatsStack(ULyraInventoryItemInstance* Item, int32 Count)
+{
+	if (!Item || Count <= 0) return;
+
+	static UFunction* Func = Item->FindFunction(FName("AddStatTagStack"));
+	if (Func)
+	{
+		struct FParams { FGameplayTag Tag; int32 StackCount; };
+		FParams Params;
+		Params.Tag = OWRPGGameplayTags::OWRPG_Inventory_Stack;
+		Params.StackCount = Count;
+
+		Item->ProcessEvent(Func, &Params);
+	}
+}
+
+void UOWRPGInventoryFunctionLibrary::RemoveItemStatsStack(ULyraInventoryItemInstance* Item, int32 Count)
+{
+	if (!Item || Count <= 0) return;
+
+	static UFunction* Func = Item->FindFunction(FName("RemoveStatTagStack"));
+	if (Func)
+	{
+		struct FParams { FGameplayTag Tag; int32 StackCount; };
+		FParams Params;
+		Params.Tag = OWRPGGameplayTags::OWRPG_Inventory_Stack;
+		Params.StackCount = Count;
+
+		Item->ProcessEvent(Func, &Params);
+	}
+}
 
 // --- TRAIT LOGIC ---
 
@@ -73,44 +164,12 @@ const UOWRPGInventoryFragment_CoreStats* UOWRPGInventoryFunctionLibrary::GetItem
 	return nullptr;
 }
 
-// 1. Centralized Stack Count Logic (The Reflection Fix)
 int32 UOWRPGInventoryFunctionLibrary::GetItemQuantity(const ULyraInventoryItemInstance* ItemInstance)
 {
-	if (!ItemInstance) return 0;
-
-	// Default to 1 (If instance exists, there is at least 1)
-	int32 Count = 1;
-
-	// WORKAROUND: LyraInventoryItemInstance::GetStatTagStackCount is not exported.
-	// We use reflection to find the private 'StatTags' property.
-	static FProperty* StatTagsProp = ULyraInventoryItemInstance::StaticClass()->FindPropertyByName(FName("StatTags"));
-
-	if (FStructProperty* StructProp = CastField<FStructProperty>(StatTagsProp))
-	{
-		if (StructProp->Struct->GetFName() == FName("GameplayTagStackContainer"))
-		{
-			const FGameplayTagStackContainer* Container = StructProp->ContainerPtrToValuePtr<FGameplayTagStackContainer>(ItemInstance);
-			if (Container)
-			{
-				// Check for the standard Lyra stack tag. 
-				// 'false' prevents error log if tag is missing in config.
-				FGameplayTag StackTag = FGameplayTag::RequestGameplayTag(FName("Lyra.Inventory.StackCount"), false);
-
-				if (StackTag.IsValid())
-				{
-					int32 FoundCount = Container->GetStackCount(StackTag);
-					if (FoundCount > 0)
-					{
-						Count = FoundCount;
-					}
-				}
-			}
-		}
-	}
-	return Count;
+	// Updated to use the new Helper
+	return GetItemStatsStackCount(const_cast<ULyraInventoryItemInstance*>(ItemInstance));
 }
 
-// 2. Updated Weight Function (Uses GetItemQuantity)
 float UOWRPGInventoryFunctionLibrary::GetItemWeight(const ULyraInventoryItemInstance* ItemInstance)
 {
 	if (const UOWRPGInventoryFragment_CoreStats* Stats = GetItemStats(ItemInstance))
@@ -138,12 +197,10 @@ FText UOWRPGInventoryFunctionLibrary::GetItemDisplayName(const ULyraInventoryIte
 	{
 		if (const ULyraInventoryItemDefinition* Def = GetDefault<ULyraInventoryItemDefinition>(ItemInstance->GetItemDef()))
 		{
-			// 1. Check Native Lyra Display Name
 			if (!Def->DisplayName.IsEmpty())
 			{
 				return Def->DisplayName;
 			}
-			// 2. Fallback to Class Name
 			return FText::FromString(Def->GetName());
 		}
 	}
@@ -248,7 +305,6 @@ void UOWRPGInventoryFunctionLibrary::UpdateGenericItemVisuals(AActor* VisualActo
 {
 	if (!VisualActor || !Item) return;
 
-	// Cast to smart actor
 	if (AOWRPGVisualItemActor* SmartVisual = Cast<AOWRPGVisualItemActor>(VisualActor))
 	{
 		const ULyraInventoryItemDefinition* Def = GetDefault<ULyraInventoryItemDefinition>(Item->GetItemDef());
@@ -256,17 +312,14 @@ void UOWRPGInventoryFunctionLibrary::UpdateGenericItemVisuals(AActor* VisualActo
 		{
 			if (UIFrag->WorldMesh)
 			{
-				// Call the function that handles replication
 				SmartVisual->SetItemMesh(UIFrag->WorldMesh);
 			}
 		}
 	}
 	else
 	{
-		// Try to find a Static Mesh Component
 		if (UStaticMeshComponent* MeshComp = VisualActor->FindComponentByClass<UStaticMeshComponent>())
 		{
-			// Get the mesh from the Item Definition -> UI Fragment
 			const ULyraInventoryItemDefinition* Def = GetDefault<ULyraInventoryItemDefinition>(Item->GetItemDef());
 			if (const UOWRPGInventoryFragment_UI* UIFrag = FindItemDefinitionFragment<UOWRPGInventoryFragment_UI>(Def))
 			{

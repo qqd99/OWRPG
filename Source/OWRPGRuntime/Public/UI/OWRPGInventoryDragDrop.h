@@ -7,10 +7,11 @@
 #include "OWRPGInventoryDragDrop.generated.h"
 
 class ULyraInventoryItemInstance;
+class UOWRPGInventoryManagerComponent;
+class UUserWidget;
 
 /**
- * Payload for dragging an item.
- * Stores the item data and cached dimensions for the Grid to read efficiently.
+ * Payload for Inventory Drag & Drop operations.
  */
 UCLASS()
 class OWRPGRUNTIME_API UOWRPGInventoryDragDrop : public UDragDropOperation
@@ -18,29 +19,28 @@ class OWRPGRUNTIME_API UOWRPGInventoryDragDrop : public UDragDropOperation
 	GENERATED_BODY()
 
 public:
-	// The data being dragged
+	// --- WEAK REFERENCES (Prevents GC Crashes) ---
+
+	/** The item being moved. WeakPtr ensures we don't keep the World alive if PIE stops. */
+	TWeakObjectPtr<ULyraInventoryItemInstance> DraggedItem;
+
+	/** Helper to get the item safely in Blueprints */
+	UFUNCTION(BlueprintPure, Category = "Drag Drop")
+	ULyraInventoryItemInstance* GetDraggedItem() const;
+
+	/** Where the item came from. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
-	TObjectPtr<ULyraInventoryItemInstance> DraggedItem;
+	TWeakObjectPtr<UOWRPGInventoryManagerComponent> SourceComponent;
 
-	// The widget that started the drag (useful if we need to show it again on cancel)
+	/** The widget that started the drag. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
-	TObjectPtr<UUserWidget> SourceWidget;
+	TWeakObjectPtr<UUserWidget> SourceWidget;
 
-	// --- CACHED PROPERTIES (Optimization) ---
+	// --- DATA ---
 
-	// Width in grid cells
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
-	int32 DraggedItemW = 1;
+	bool bRotated = false;
 
-	// Height in grid cells
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
-	int32 DraggedItemH = 1;
-
-	// Is the dragged item currently rotated?
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
-	bool bIsRotated = false;
-
-	// Mouse offset from the top-left of the item widget
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drag Drop")
 	FVector2D DragOffset = FVector2D::ZeroVector;
 };

@@ -1,184 +1,164 @@
 // Copyright Legion. All Rights Reserved.
 
 #include "UI/OWRPGInventoryItemWidget.h"
-#include "Inventory/OWRPGInventoryManagerComponent.h"
-#include "Inventory/LyraInventoryItemInstance.h"
-#include "Inventory/OWRPGInventoryFragment_UI.h" 
-#include "Inventory/OWRPGInventoryFunctionLibrary.h"
-#include "System/OWRPGGameplayTags.h"
-#include "UI/OWRPGInventoryDragDrop.h"
-#include "Blueprint/WidgetLayoutLibrary.h"
-#include "Components/Image.h" 
+#include "Components/Image.h"
 #include "Components/TextBlock.h"
-#include "Components/SizeBox.h"
+#include "Components/SizeBox.h" 
+#include "Inventory/OWRPGInventoryFragment_UI.h"
+#include "Inventory/OWRPGInventoryFragment_CoreStats.h"
+#include "Inventory/OWRPGInventoryFunctionLibrary.h" 
+#include "Inventory/OWRPGInventoryManagerComponent.h"
+#include "UI/OWRPGInventoryDragDrop.h"
+#include "Blueprint/WidgetBlueprintLibrary.h"
+#include "System/OWRPGGameplayTags.h"
 
-void UOWRPGInventoryItemWidget::UpdateVisual_Implementation()
+void UOWRPGInventoryItemWidget::NativeDestruct()
 {
-	if (!ItemInstance || !InventoryManager) return;
+	Super::NativeDestruct();
+	// Stop reference cycles
+	SetToolTip(nullptr);
+	ItemInstance.Reset();
+	InventoryManager.Reset();
+}
 
-	// 1. Calculate Size based on Dimensions and Rotation
-	int32 W, H;
-	InventoryManager->GetItemDimensions(ItemInstance, W, H, bIsRotated);
+void UOWRPGInventoryItemWidget::Init(ULyraInventoryItemInstance* InItem, UOWRPGInventoryManagerComponent* InManager, float InTileSize, bool bIsDragVisual)
+{
+	InventoryManager = InManager;
+	TileSize = InTileSize;
+	bIsDragVisualWidget = bIsDragVisual; // Store Flag
 
-	float PixelW = W * TileSize;
-	float PixelH = H * TileSize;
+	Refresh(InItem);
+}
 
-	// 2. Apply Size
-	SetDesiredSizeInViewport(FVector2D(PixelW, PixelH));
-	if (USizeBox* RootSizeBox = Cast<USizeBox>(GetRootWidget()))
+void UOWRPGInventoryItemWidget::Refresh(ULyraInventoryItemInstance* InItem)
+{
+	ItemInstance = InItem;
+
+	if (!InItem)
 	{
-		RootSizeBox->SetWidthOverride(PixelW);
-		RootSizeBox->SetHeightOverride(PixelH);
+		SetVisibility(ESlateVisibility::Hidden);
+		return;
 	}
 
-	// 3. Apply Icon
+	SetVisibility(ESlateVisibility::Visible);
+
 	if (IconImage)
 	{
-		// Render Transform for Rotation (90 degrees if rotated)
-		if (bIsRotated)
+		UTexture2D* IconTex = UOWRPGInventoryFunctionLibrary::GetItemIcon(InItem);
+		if (IconTex)
 		{
-			IconImage->SetRenderTransformAngle(90.0f);
+			IconImage->SetBrushFromTexture(IconTex);
+			IconImage->SetVisibility(ESlateVisibility::HitTestInvisible);
 		}
 		else
 		{
-			IconImage->SetRenderTransformAngle(0.0f);
-		}
-
-		// Find Icon
-		const ULyraInventoryItemDefinition* Def = GetDefault<ULyraInventoryItemDefinition>(ItemInstance->GetItemDef());
-		if (Def)
-		{
-			if (const UOWRPGInventoryFragment_UI* UIFrag = UOWRPGInventoryFunctionLibrary::FindItemDefinitionFragment<UOWRPGInventoryFragment_UI>(Def))
-			{
-				if (UIFrag->Icon)
-				{
-					IconImage->SetBrushFromTexture(UIFrag->Icon);
-				}
-			}
+			IconImage->SetBrushFromTexture(nullptr);
 		}
 	}
 
-	// 4. Apply Stack Count
-	if (StackText)
+	if (StackCountText)
 	{
-		int32 Count = 0;
-		// Reflection call to GetStatTagStackCount
-		static UFunction* GetStackFunc = ItemInstance->FindFunction(TEXT("GetStatTagStackCount"));
-		if (GetStackFunc)
-		{
-			struct FParams { FGameplayTag Tag; int32 ReturnValue; };
-			FParams Params;
-			Params.Tag = OWRPGGameplayTags::OWRPG_Inventory_Stack;
-			Params.ReturnValue = 0;
-			ItemInstance->ProcessEvent(GetStackFunc, &Params);
-			Count = Params.ReturnValue;
-		}
-
+		int32 Count = UOWRPGInventoryFunctionLibrary::GetItemStatsStackCount(InItem);
 		if (Count > 1)
 		{
-			StackText->SetText(FText::AsNumber(Count));
-			StackText->SetVisibility(ESlateVisibility::HitTestInvisible);
+			StackCountText->SetText(FText::AsNumber(Count));
+			StackCountText->SetVisibility(ESlateVisibility::HitTestInvisible);
 		}
 		else
 		{
-			StackText->SetVisibility(ESlateVisibility::Collapsed);
+			StackCountText->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+
+	// CRITICAL FIX: If this is a drag visual, NEVER create a tooltip.
+	// This breaks the reference chain that keeps the World alive in the Editor.
+	if (bIsDragVisualWidget)
+	{
+		SetToolTip(nullptr);
+		// Set HitTestInvisible so Slate doesn't try to interact with it
+		SetVisibility(ESlateVisibility::HitTestInvisible);
+	}
+	else if (!IsDesignTime())
+	{
+		FText Name = UOWRPGInventoryFunctionLibrary::GetItemDisplayName(InItem);
+		if (!Name.IsEmpty())
+		{
+			SetToolTipText(Name);
 		}
 	}
 }
 
+void UOWRPGInventoryItemWidget::NativeOnListItemObjectSet(UObject* ListItemObject)
+{
+	if (ULyraInventoryItemInstance* Item = Cast<ULyraInventoryItemInstance>(ListItemObject))
+	{
+		Refresh(Item);
+	}
+}
+
+FReply UOWRPGInventoryItemWidget::NativeOnMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
+{
+	if (InMouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		return UWidgetBlueprintLibrary::DetectDragIfPressed(InMouseEvent, this, EKeys::LeftMouseButton).NativeReply;
+	}
+	else if (InMouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+	{
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
+}
+
 void UOWRPGInventoryItemWidget::NativeOnDragDetected(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent, UDragDropOperation*& OutOperation)
 {
-	Super::NativeOnDragDetected(InGeometry, InMouseEvent, OutOperation);
+	if (!ItemInstance.IsValid() || !InventoryManager.IsValid()) return;
 
-	if (!ItemInstance || !InventoryManager) return;
-
-	// 1. Tell Server: Pickup Logic
-	InventoryManager->ServerPickupItem(ItemInstance);
-
-	// 2. Create Drag Payload
 	UOWRPGInventoryDragDrop* DragOp = NewObject<UOWRPGInventoryDragDrop>();
-	DragOp->DraggedItem = ItemInstance;
+
+	// Weak Pointers
+	DragOp->DraggedItem = ItemInstance.Get();
+	DragOp->SourceComponent = InventoryManager.Get();
 	DragOp->SourceWidget = this;
-	DragOp->bIsRotated = bIsRotated; // Pass current rotation state
 
-	// Cache Dimensions for Grid
-	InventoryManager->GetItemDimensions(ItemInstance, DragOp->DraggedItemW, DragOp->DraggedItemH, bIsRotated);
+	int32 W, H;
+	InventoryManager->GetItemDimensions(ItemInstance.Get(), W, H, false);
+	float WidthPX = W * TileSize;
+	float HeightPX = H * TileSize;
 
-	// Calculate Mouse Offset (So item doesn't snap to 0,0 relative to cursor)
-	DragOp->DragOffset = InGeometry.AbsoluteToLocal(InMouseEvent.GetScreenSpacePosition());
+	// Center Snap Offset
+	DragOp->DragOffset = FVector2D(WidthPX * 0.5f, HeightPX * 0.5f);
 
-	// 3. Create Visual (Ghost)
-	UOWRPGInventoryItemWidget* DragVisual = CreateWidget<UOWRPGInventoryItemWidget>(GetOwningPlayer(), GetClass());
-	if (DragVisual)
-	{
-		DragVisual->ItemInstance = ItemInstance;
-		DragVisual->InventoryManager = InventoryManager;
-		DragVisual->TileSize = this->TileSize;
-		DragVisual->bIsRotated = this->bIsRotated; // Keep visual rotation
-		DragVisual->UpdateVisual();
-	}
+	USizeBox* VisualContainer = NewObject<USizeBox>(this);
+	VisualContainer->SetWidthOverride(WidthPX);
+	VisualContainer->SetHeightOverride(HeightPX);
 
-	DragOp->DefaultDragVisual = DragVisual;
-	DragOp->Pivot = EDragPivot::MouseDown;
+	// Create Visual with Flag = true
+	UOWRPGInventoryItemWidget* VisualWidget = CreateWidget<UOWRPGInventoryItemWidget>(this, GetClass());
+	VisualWidget->Init(ItemInstance.Get(), InventoryManager.Get(), TileSize, true); // <--- TRUE
 
-	// 4. Hide original
-	SetVisibility(ESlateVisibility::HitTestInvisible); // Or Hidden/Collapsed depending on preference
+	VisualContainer->SetContent(VisualWidget);
+
+	DragOp->DefaultDragVisual = VisualContainer;
+	DragOp->Pivot = EDragPivot::CenterCenter;
+
+	SetVisibility(ESlateVisibility::Hidden);
 
 	OutOperation = DragOp;
+}
+
+void UOWRPGInventoryItemWidget::NativeOnDragCancelled(const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation)
+{
+	SetVisibility(ESlateVisibility::Visible);
 }
 
 void UOWRPGInventoryItemWidget::NativeOnMouseEnter(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
 {
 	Super::NativeOnMouseEnter(InGeometry, InMouseEvent);
-
-	// Create Tooltip
-	if (TooltipWidgetClass && !GetToolTip())
-	{
-		UUserWidget* TooltipWidget = CreateWidget<UUserWidget>(GetOwningPlayer(), TooltipWidgetClass);
-		// Note: You can cast TooltipWidget to a custom class and pass ItemInstance here
-		SetToolTip(TooltipWidget);
-	}
+	if (BackgroundImage) BackgroundImage->SetColorAndOpacity(FLinearColor(1.0f, 1.0f, 1.0f, 0.8f));
 }
 
 void UOWRPGInventoryItemWidget::NativeOnMouseLeave(const FPointerEvent& InMouseEvent)
 {
 	Super::NativeOnMouseLeave(InMouseEvent);
-}
-
-FReply UOWRPGInventoryItemWidget::NativeOnMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
-{
-	// Right Click -> Context Menu
-	if (InMouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
-	{
-		CreateContextMenu();
-		return FReply::Handled();
-	}
-
-	// Left Click -> Start Drag Detection
-	if (InMouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-	{
-		return FReply::Handled().DetectDrag(TakeWidget(), EKeys::LeftMouseButton);
-	}
-
-	return Super::NativeOnMouseButtonDown(InGeometry, InMouseEvent);
-}
-
-void UOWRPGInventoryItemWidget::CreateContextMenu()
-{
-	if (!ContextMenuClass || !ItemInstance) return;
-
-	// 1. Create Menu Widget
-	UUserWidget* Menu = CreateWidget<UUserWidget>(GetOwningPlayer(), ContextMenuClass);
-	if (Menu)
-	{
-		// 2. Add to Viewport
-		Menu->AddToViewport(100); // High Z-Order
-
-		// 3. Position at Mouse
-		FVector2D MousePos = UWidgetLayoutLibrary::GetMousePositionOnViewport(GetWorld());
-		Menu->SetPositionInViewport(MousePos, false);
-
-		// 4. Pass Data to BP
-		OnContextOpened(Menu, ItemInstance);
-	}
+	if (BackgroundImage) BackgroundImage->SetColorAndOpacity(FLinearColor(1.0f, 1.0f, 1.0f, 0.3f));
 }

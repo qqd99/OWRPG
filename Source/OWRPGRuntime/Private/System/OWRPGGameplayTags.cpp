@@ -21,6 +21,10 @@ namespace OWRPGGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Cheat_UnlimitedStamina, "OWRPG.Cheat.UnlimitedStamina");
 	UE_DEFINE_GAMEPLAY_TAG(Cheat_GodMode, "OWRPG.Cheat.GodMode");
 
+	// ABILITY
+	UE_DEFINE_GAMEPLAY_TAG(Ability_Drop, "Ability.Type.Drop");
+	UE_DEFINE_GAMEPLAY_TAG(Ability_Inventory, "Ability.Type.Inventory");
+
 	// --- ITEM SYSTEM ---
 
 	// CATEGORIES

@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "GameplayTagContainer.h"
-#include "Inventory/LyraInventoryItemDefinition.h" // Needed for Fragments access
+#include "Inventory/LyraInventoryItemDefinition.h" 
 #include "OWRPGInventoryFunctionLibrary.generated.h"
 
 class ULyraInventoryItemInstance;
@@ -24,6 +24,8 @@ class OWRPGRUNTIME_API UOWRPGInventoryFunctionLibrary : public UBlueprintFunctio
 public:
 
 	// --- HELPER TO BYPASS LINKER ERRORS ---
+
+	// Template Version (C++ Only)
 	template <typename T>
 	static const T* FindItemDefinitionFragment(const ULyraInventoryItemDefinition* ItemDef)
 	{
@@ -39,9 +41,31 @@ public:
 		}
 		return nullptr;
 	}
+
+	// Blueprint Version
+	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory", meta = (DeterminesOutputType = "FragmentClass"))
+	static const ULyraInventoryItemFragment* FindItemDefinitionFragment(const ULyraInventoryItemDefinition* ItemDef, TSubclassOf<ULyraInventoryItemFragment> FragmentClass);
+
 	// --------------------------------------
 
-	// --- NEW: TRAIT & CATEGORY SYSTEM ---
+	// --- STACKING HELPERS (Reflected to avoid Linker Errors) ---
+	// These replace direct calls to LyraInventoryItemInstance::AddStatTagStack to fix LNK2019
+
+	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory|Stacking")
+	static int32 GetItemStatsStackCount(ULyraInventoryItemInstance* Item);
+
+	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory|Stacking")
+	static bool HasItemStatsStack(ULyraInventoryItemInstance* Item);
+
+	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory|Stacking")
+	static void AddItemStatsStack(ULyraInventoryItemInstance* Item, int32 Count);
+
+	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory|Stacking")
+	static void RemoveItemStatsStack(ULyraInventoryItemInstance* Item, int32 Count);
+
+	// --------------------------------------
+
+	// --- TRAIT & CATEGORY SYSTEM ---
 
 	/** Checks if an item definition has a specific trait (e.g., Trait.Material.Metal). */
 	UFUNCTION(BlueprintCallable, Category = "OWRPG|Inventory", meta = (DeterminesOutputType = "FragmentClass"))
@@ -56,7 +80,7 @@ public:
 	static FGameplayTag GetItemCategory(const ULyraInventoryItemInstance* ItemInstance);
 
 
-	// --- RESTORED: CORE STATS & UTILITY ---
+	// --- CORE STATS & UTILITY ---
 
 	/** Returns the CoreStats fragment from an item instance (if it exists). */
 	UFUNCTION(BlueprintPure, Category = "OWRPG|Inventory")
@@ -87,7 +111,7 @@ public:
 	static bool RemoveItemFromInventory(AController* Controller, ULyraInventoryItemInstance* ItemInstance);
 
 
-	// --- RESTORED: EQUIPMENT UTILITY ---
+	// --- EQUIPMENT UTILITY ---
 
 	/** Helper to find the Equipment Instance associated with a specific Inventory Item. */
 	UFUNCTION(BlueprintCallable, Category = "OWRPG|Equipment")

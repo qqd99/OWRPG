@@ -4,17 +4,47 @@
 #include "UI/OWRPGInventoryItemWidget.h"
 #include "UI/OWRPGInventoryDragDrop.h"
 #include "Inventory/OWRPGInventoryManagerComponent.h"
+#include "Inventory/OWRPGInventoryFunctionLibrary.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/Image.h"
+#include "Components/SizeBox.h"
 #include "Components/Border.h"
-#include "Blueprint/WidgetLayoutLibrary.h"
-#include "Rendering/DrawElements.h"
-#include "GameFramework/PlayerController.h" 
-#include "InputCoreTypes.h"
-#include <Components/SizeBox.h>
+#include "Blueprint/WidgetBlueprintLibrary.h"
+
+void UOWRPGInventoryGridWidget::NativeConstruct()
+{
+	Super::NativeConstruct();
+	if (DragHighlight)
+	{
+		DragHighlight->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+// Stop the Memory Leak / GC Error
+void UOWRPGInventoryGridWidget::NativeDestruct()
+{
+	Super::NativeDestruct();
+
+	if (InventoryManager)
+	{
+		InventoryManager->OnInventoryRefresh.RemoveDynamic(this, &UOWRPGInventoryGridWidget::RefreshGrid);
+	}
+
+	// FIX: Force clear all widgets so they release references immediately
+	WidgetPool.Empty();
+	ActiveItemWidgets.Empty();
+	if (GridCanvas)
+	{
+		GridCanvas->ClearChildren();
+	}
+}
 
 void UOWRPGInventoryGridWidget::InitializeGrid(UOWRPGInventoryManagerComponent* InManager)
 {
+	if (!InManager) return;
+
+	// Unbind potential old bindings first to be safe
 	if (InventoryManager)
 	{
 		InventoryManager->OnInventoryRefresh.RemoveDynamic(this, &UOWRPGInventoryGridWidget::RefreshGrid);
@@ -22,211 +52,214 @@ void UOWRPGInventoryGridWidget::InitializeGrid(UOWRPGInventoryManagerComponent* 
 
 	InventoryManager = InManager;
 
-	if (InventoryManager)
+	// Dynamic Resizing logic
+	// This ensures the grid visual always matches the data (10x10, 5x5, etc)
+	if (GridSizeBox)
 	{
-		InventoryManager->OnInventoryRefresh.AddDynamic(this, &UOWRPGInventoryGridWidget::RefreshGrid);
-		RefreshGrid();
+		float TotalWidth = InManager->Columns * TileSize;
+		float TotalHeight = InManager->Rows * TileSize;
+
+		GridSizeBox->SetWidthOverride(TotalWidth);
+		GridSizeBox->SetHeightOverride(TotalHeight);
 	}
+
+	// Bind to updates
+	InventoryManager->OnInventoryRefresh.AddDynamic(this, &UOWRPGInventoryGridWidget::RefreshGrid);
+
+	// Initial Draw
+	DrawGridLines();
+	RefreshGrid();
 }
 
-void UOWRPGInventoryGridWidget::NativeDestruct()
+void UOWRPGInventoryGridWidget::DrawGridLines()
 {
-	Super::NativeDestruct();
-	if (InventoryManager)
-	{
-		InventoryManager->OnInventoryRefresh.RemoveDynamic(this, &UOWRPGInventoryGridWidget::RefreshGrid);
-	}
+	if (!BackgroundCanvas || !InventoryManager) return;
+	// TODO Optional: You can implement dynamic line drawing here using OnPaint 
+	// or by spawning Image widgets into BackgroundCanvas if strictly necessary.
 }
 
+// ==============================================================================
+// POOLING REFRESH (The Optimization)
+// ==============================================================================
 void UOWRPGInventoryGridWidget::RefreshGrid()
 {
 	if (!InventoryManager || !GridCanvas || !ItemWidgetClass) return;
 
-	// 1. Calculate Required Pixel Size
-	float TotalWidth = InventoryManager->Columns * TileSize;
-	float TotalHeight = InventoryManager->Rows * TileSize;
+	// 1. Mark all active widgets as potentially unused
+	TSet<ULyraInventoryItemInstance*> ProcessedItems;
 
-	// 2. Force the Canvas to this size
-	if (UCanvasPanelSlot* RootSlot = Cast<UCanvasPanelSlot>(GridCanvas->Slot))
-	{
-		RootSlot->SetSize(FVector2D(TotalWidth, TotalHeight));
-	}
+	// We use the raw list to know "What exists"
+	const TArray<FOWRPGInventoryEntry>& Entries = InventoryManager->InventoryList.Entries;
 
-	// 3. Force the Widget itself to this size (Dynamic resizing)
-	SetDesiredSizeInViewport(FVector2D(TotalWidth, TotalHeight));
-
-	if (USizeBox* RootSize = Cast<USizeBox>(GetRootWidget())) {
-	    RootSize->SetWidthOverride(TotalWidth);
-	    RootSize->SetHeightOverride(TotalHeight);
-	}
-
-	GridCanvas->ClearChildren();
-	ItemWidgets.Empty();
-
-	for (const FOWRPGInventoryEntry& Entry : InventoryManager->InventoryList.Entries)
+	for (const FOWRPGInventoryEntry& Entry : Entries)
 	{
 		if (!Entry.Item) continue;
 
-		UOWRPGInventoryItemWidget* NewWidget = CreateWidget<UOWRPGInventoryItemWidget>(this, ItemWidgetClass);
-		NewWidget->ItemInstance = Entry.Item;
-		NewWidget->InventoryManager = InventoryManager;
-		NewWidget->TileSize = this->TileSize;
-		NewWidget->bIsRotated = Entry.bRotated; // Visual Rotation
-		NewWidget->UpdateVisual();
+		ProcessedItems.Add(Entry.Item);
 
-		UCanvasPanelSlot* CanvasSlot = GridCanvas->AddChildToCanvas(NewWidget);
-		CanvasSlot->SetPosition(FVector2D(Entry.X * TileSize, Entry.Y * TileSize));
+		UOWRPGInventoryItemWidget* Widget = nullptr;
 
-		int32 W, H;
-		InventoryManager->GetItemDimensions(Entry.Item, W, H, Entry.bRotated);
-		CanvasSlot->SetSize(FVector2D(W * TileSize, H * TileSize));
-
-		ItemWidgets.Add(Entry.Item, NewWidget);
-	}
-}
-
-// --- DRAG LOGIC ---
-
-void UOWRPGInventoryGridWidget::CheckRotationInput()
-{
-	if (APlayerController* PC = GetOwningPlayer())
-	{
-		// Detect 'R' key press to toggle rotation
-		// NOTE: This runs every frame during DragOver
-		if (PC->WasInputKeyJustPressed(EKeys::R))
+		// Check if we already have a widget for this item
+		if (TObjectPtr<UOWRPGInventoryItemWidget>* FoundWidgetPtr = ActiveItemWidgets.Find(Entry.Item))
 		{
-			bIsDraggingRotated = !bIsDraggingRotated;
+			Widget = *FoundWidgetPtr;
+		}
+		else
+		{
+			// Create/Pool new widget
+			Widget = GetFreeWidget();
+			ActiveItemWidgets.Add(Entry.Item, Widget);
+			GridCanvas->AddChild(Widget);
+		}
+
+		// Update Position
+		if (Widget)
+		{
+			if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(Widget->Slot))
+			{
+				CanvasSlot->SetPosition(FVector2D(Entry.X * TileSize, Entry.Y * TileSize));
+
+				// Update Size
+				int32 W, H;
+				InventoryManager->GetItemDimensions(Entry.Item, W, H, Entry.bRotated);
+				CanvasSlot->SetSize(FVector2D(W * TileSize, H * TileSize));
+			}
+
+			// Refresh Data
+			Widget->Init(Entry.Item, InventoryManager, TileSize, false);
+			Widget->SetVisibility(ESlateVisibility::Visible);
 		}
 	}
+
+	// Cleanup Unused Widgets
+	TArray<ULyraInventoryItemInstance*> ItemsToRemove;
+	for (auto& Elem : ActiveItemWidgets)
+	{
+		// Elem.Key is TObjectPtr, implicit cast to Raw Pointer for Set lookup is fine usually, 
+		// but explicit Get() is safer if strict.
+		if (!ProcessedItems.Contains(Elem.Key.Get()))
+		{
+			ItemsToRemove.Add(Elem.Key.Get());
+			// Return widget to pool
+			if (Elem.Value)
+			{
+				Elem.Value->SetVisibility(ESlateVisibility::Collapsed);
+				WidgetPool.Add(Elem.Value);
+			}
+		}
+	}
+
+	for (ULyraInventoryItemInstance* Item : ItemsToRemove)
+	{
+		ActiveItemWidgets.Remove(Item);
+	}
 }
+
+UOWRPGInventoryItemWidget* UOWRPGInventoryGridWidget::GetFreeWidget()
+{
+	if (WidgetPool.Num() > 0)
+	{
+		// Pop returns TObjectPtr, implicit cast to raw pointer
+		return WidgetPool.Pop();
+	}
+
+	// Create new
+	return CreateWidget<UOWRPGInventoryItemWidget>(this, ItemWidgetClass);
+}
+
+// ==============================================================================
+// DRAG AND DROP
+// ==============================================================================
 
 bool UOWRPGInventoryGridWidget::NativeOnDragOver(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation)
 {
 	UOWRPGInventoryDragDrop* DragOp = Cast<UOWRPGInventoryDragDrop>(InOperation);
 	if (!DragOp || !InventoryManager) return false;
 
-	// 1. Rotation Input Check (If you implemented the 'R' key logic)
-	CheckRotationInput();
+	// Check if Source is still valid (Weak Ptr)
+	if (!DragOp->SourceComponent.IsValid()) return false;
 
-	// 2. Determine Dimensions (Base + Rotation Flip)
-	int32 BaseW, BaseH;
-	if (DragOp->DraggedItemW > 0)
-	{
-		BaseW = DragOp->DraggedItemW;
-		BaseH = DragOp->DraggedItemH;
-	}
-	else
-	{
-		// Fallback if not cached
-		InventoryManager->GetItemDimensions(DragOp->DraggedItem, BaseW, BaseH, false);
-	}
+	// 1. Get Mouse Position in Local Grid Space
+	FVector2D MousePos = InGeometry.AbsoluteToLocal(InDragDropEvent.GetScreenSpacePosition());
 
-	// Apply Rotation Logic: If rotated, flip W and H
-	bool bFinalRotated = (DragOp->bIsRotated != bIsDraggingRotated);
+	// 2. Calculate Top-Left based on DragOffset (Half Size)
+	// Example: Mouse is at (100, 100). Item is 100x100. Offset is (50, 50).
+	// Top Left = (50, 50). Slot = 1,1.
+	FVector2D ItemTopLeft = MousePos - DragOp->DragOffset;
 
-	if (bFinalRotated)
-	{
-		DraggedW = BaseH;
-		DraggedH = BaseW;
-	}
-	else
-	{
-		DraggedW = BaseW;
-		DraggedH = BaseH;
-	}
+	int32 HoveredX = FMath::RoundToInt(ItemTopLeft.X / TileSize);
+	int32 HoveredY = FMath::RoundToInt(ItemTopLeft.Y / TileSize);
 
-	// 3. Calculate Grid Index based on Mouse Position
-	FVector2D LocalPos = InGeometry.AbsoluteToLocal(InDragDropEvent.GetScreenSpacePosition());
+	int32 W, H;
+	InventoryManager->GetItemDimensions(DragOp->DraggedItem.Get(), W, H, DragOp->bRotated);
 
-	// Offset so we drag from the "Click Point" relative to the item, not always top-left
-	LocalPos -= DragOp->DragOffset;
-
-	int32 NewHoveredX = FMath::FloorToInt(LocalPos.X / TileSize);
-	int32 NewHoveredY = FMath::FloorToInt(LocalPos.Y / TileSize);
-
-	// 4. BOUNDARY CHECK (The Fix)
-	// If the top-left corner of the drag is outside the grid, stop drawing immediately.
-	if (NewHoveredX < 0 || NewHoveredY < 0 ||
-		NewHoveredX >= InventoryManager->Columns ||
-		NewHoveredY >= InventoryManager->Rows)
-	{
-		bIsDraggingOver = false; // Prevents NativePaint from drawing the box
-		return false;            // Reject the drag over event
-	}
-
-	// 5. Update State
-	HoveredX = NewHoveredX;
-	HoveredY = NewHoveredY;
-
-	// 6. Check Placement Validity (Logic for Red/Green)
-	// Even if the cursor is valid (e.g. at 9,9), the item might be huge (2x2) and go out of bounds.
-	bool bOutOfBounds = (HoveredX + DraggedW) > InventoryManager->Columns || (HoveredY + DraggedH) > InventoryManager->Rows;
+	// Check Bounds
+	bool bOutOfBounds = (HoveredX < 0 || HoveredY < 0 || (HoveredX + W) > InventoryManager->Columns || (HoveredY + H) > InventoryManager->Rows);
 
 	if (bOutOfBounds)
 	{
-		bIsPlacementValid = false; // Draw RED
+		if (DragHighlight) DragHighlight->SetVisibility(ESlateVisibility::Collapsed);
+		return false;
 	}
-	else
+
+	// UPDATE HIGHLIGHT
+	if (DragHighlight)
 	{
-		// Check "Tetris" overlaps (Predictive)
-		// We pass 'DragOp->DraggedItem' as the item to Exclude (ignore self)
-		TArray<ULyraInventoryItemInstance*> Overlaps = InventoryManager->GetItemsInRect(HoveredX, HoveredY, DraggedW, DraggedH, DragOp->DraggedItem);
-
-		// Logic: 0 overlaps = Green (Place). 1 overlap = Green (Swap). >1 overlaps = Red (Blocked).
-		bIsPlacementValid = (Overlaps.Num() <= 1);
+		if (UCanvasPanelSlot* HighlightSlot = Cast<UCanvasPanelSlot>(DragHighlight->Slot))
+		{
+			HighlightSlot->SetPosition(FVector2D(HoveredX * TileSize, HoveredY * TileSize));
+			HighlightSlot->SetSize(FVector2D(W * TileSize, H * TileSize));
+		}
+		DragHighlight->SetVisibility(ESlateVisibility::HitTestInvisible);
 	}
 
-	bIsDraggingOver = true; // Tells NativePaint to draw the box
+	return true;
+}
+
+bool UOWRPGInventoryGridWidget::NativeOnDrop(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation)
+{
+	if (DragHighlight) DragHighlight->SetVisibility(ESlateVisibility::Collapsed);
+
+	UOWRPGInventoryDragDrop* DragOp = Cast<UOWRPGInventoryDragDrop>(InOperation);
+	if (!DragOp || !InventoryManager) return false;
+
+	// 1. Logic
+	if (DragOp->SourceComponent.IsValid()) // Check WeakPtr
+	{
+		// Unhide source
+		if (DragOp->SourceWidget.IsValid())
+		{
+			DragOp->SourceWidget->SetVisibility(ESlateVisibility::Visible);
+		}
+
+		FVector2D MousePos = InGeometry.AbsoluteToLocal(InDragDropEvent.GetScreenSpacePosition());
+		FVector2D ItemTopLeft = MousePos - DragOp->DragOffset;
+
+		int32 DestX = FMath::RoundToInt(ItemTopLeft.X / TileSize);
+		int32 DestY = FMath::RoundToInt(ItemTopLeft.Y / TileSize);
+
+		InventoryManager->ServerTransferItem(
+			DragOp->SourceComponent.Get(),
+			DragOp->DraggedItem.Get(),
+			DestX,
+			DestY,
+			DragOp->bRotated
+		);
+	}
+
+	// 2. Manually clear references to prevent Memory Leaks / GC Crash
+	// The Editor Engine caches the DragOp, so we must strip it of all World references.
+	DragOp->DraggedItem = nullptr;
+	DragOp->SourceComponent.Reset();
+	DragOp->SourceWidget.Reset();
+	DragOp->DefaultDragVisual = nullptr; // Breaks link to the Widget Tree
+
 	return true;
 }
 
 void UOWRPGInventoryGridWidget::NativeOnDragLeave(const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation)
 {
-	bIsDraggingOver = false;
-	bIsDraggingRotated = false; // Reset on leave
-}
-
-bool UOWRPGInventoryGridWidget::NativeOnDrop(const FGeometry& InGeometry, const FDragDropEvent& InDragDropEvent, UDragDropOperation* InOperation)
-{
-	UOWRPGInventoryDragDrop* DragOp = Cast<UOWRPGInventoryDragDrop>(InOperation);
-
-	if (bIsPlacementValid && InventoryManager && DragOp)
-	{
-		// Calculate final rotation state
-		bool bFinalRotated = (DragOp->bIsRotated != bIsDraggingRotated);
-
-		InventoryManager->ServerAttemptMove(DragOp->DraggedItem, HoveredX, HoveredY, bFinalRotated);
-
-		bIsDraggingOver = false;
-		bIsDraggingRotated = false;
-		return true;
-	}
-
-	return false;
-}
-
-int32 UOWRPGInventoryGridWidget::NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
-{
-	int32 MaxLayer = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
-
-	if (bIsDraggingOver)
-	{
-		FLinearColor Color = bIsPlacementValid ? ValidDropColor : InvalidDropColor;
-
-		FPaintGeometry PaintGeo = AllottedGeometry.ToPaintGeometry(
-			FVector2D(DraggedW * TileSize, DraggedH * TileSize),
-			FSlateLayoutTransform(FVector2D(HoveredX * TileSize, HoveredY * TileSize))
-		);
-
-		FSlateDrawElement::MakeBox(
-			OutDrawElements,
-			MaxLayer + 1,
-			PaintGeo,
-			FCoreStyle::Get().GetBrush("WhiteBrush"),
-			ESlateDrawEffect::None,
-			Color
-		);
-	}
-
-	return MaxLayer;
+	Super::NativeOnDragLeave(InDragDropEvent, InOperation);
+	// Hide Highlight
+	if (DragHighlight) DragHighlight->SetVisibility(ESlateVisibility::Collapsed);
 }
